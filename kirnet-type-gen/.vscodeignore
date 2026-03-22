@@ -1,0 +1,11 @@
+.vscode
+.vscode-test
+node_modules
+src
+out
+tsconfig.json
+esbuild.mjs
+.gitignore
+**/*.map
+test-parser.ts
+mock-vscode.cjs

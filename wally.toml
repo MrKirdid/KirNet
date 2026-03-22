@@ -1,0 +1,15 @@
+[package]
+name = "mrkirdid/kirnet"
+version = "1.0.4"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+exclude = [
+	"kirnet-type-gen/**",
+	"aftman.toml",
+	"default.project.json",
+	"selene.toml",
+	".stylua.toml",
+]
+
+[dependencies]
+Promise = "evaera/promise@4.0.0"

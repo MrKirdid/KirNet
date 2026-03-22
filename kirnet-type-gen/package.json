@@ -1,0 +1,73 @@
+{
+	"name": "kirnet-type-gen",
+	"displayName": "KirNet Type Generator",
+	"description": "Generates typed Luau wrappers for KirNet services and provides GetService autocomplete.",
+	"version": "0.1.0",
+	"publisher": "kirnet",
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"workspaceContains:default.project.json"
+	],
+	"main": "./dist/extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "kirnet.regenerateTypes",
+				"title": "KirNet: Regenerate Types Now"
+			},
+			{
+				"command": "kirnet.showOutput",
+				"title": "KirNet: Show Output"
+			},
+			{
+				"command": "kirnet.openTypesFile",
+				"title": "KirNet: Open Generated Types File"
+			},
+			{
+				"command": "kirnet.reloadConfig",
+				"title": "KirNet: Reload Config"
+			},
+			{
+				"command": "kirnet.listServices",
+				"title": "KirNet: List Services & Controllers"
+			},
+			{
+				"command": "kirnet.goToService",
+				"title": "KirNet: Go to Service/Controller Definition"
+			},
+			{
+				"command": "kirnet.restorePackage",
+				"title": "KirNet: Restore Original Package (Remove Injection)"
+			},
+			{
+				"command": "kirnet.createService",
+				"title": "KirNet: Create New Service"
+			},
+			{
+				"command": "kirnet.createController",
+				"title": "KirNet: Create New Controller"
+			}
+		]
+	},
+	"scripts": {
+		"compile": "tsc -p ./ --noEmit",
+		"build": "node esbuild.mjs",
+		"watch": "node esbuild.mjs --watch",
+		"package": "node esbuild.mjs && npx @vscode/vsce package --no-dependencies"
+	},
+	"dependencies": {
+		"@iarna/toml": "^2.2.5"
+	},
+	"devDependencies": {
+		"@types/node": "^20.11.0",
+		"@types/vscode": "^1.85.0",
+		"esbuild": "^0.27.4",
+		"tsx": "^4.21.0",
+		"typescript": "^5.3.3"
+	}
+}
