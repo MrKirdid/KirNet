@@ -2,7 +2,7 @@
 -- Do not edit manually. This file is overwritten on every save.
 --
 -- Require this module instead of KirNet for fully typed GetService().
--- All other KirNet methods (CreateSignal, RegisterService, etc.) work as normal.
+-- All other KirNet methods (CreateServerSignal, RegisterService, etc.) work as normal.
 
 local KirNet = require(game:GetService("ReplicatedStorage").Shared.Packages.KirNet)
 

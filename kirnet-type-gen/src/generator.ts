@@ -1,10 +1,10 @@
-import { ServiceDef } from "./parser";
+﻿import { ServiceDef } from "./parser";
 
 /**
  * Generate the Types.luau content from parsed service definitions.
  *
  * The output is a **drop-in replacement** for KirNet.  Users swap their
- * require path and keep calling `KirNet.GetService("Name")` as normal —
+ * require path and keep calling `KirNet.GetService("Name")` as normal -
  * Luau intersection-type overloads on GetService narrow the return type
  * to the correct service type based on the string literal argument.
  */
@@ -13,8 +13,6 @@ export function generateTypesContent(
 	requirePath: string,
 ): string {
 	const sorted = [...services].sort((a, b) => a.name.localeCompare(b.name));
-	const sortedServices = sorted.filter((s) => s.kind === "service");
-	const sortedControllers = sorted.filter((s) => s.kind === "controller");
 
 	const lines: string[] = [];
 
@@ -22,7 +20,7 @@ export function generateTypesContent(
 	lines.push("-- Do not edit manually. This file is overwritten on every save.");
 	lines.push("--");
 	lines.push("-- Require this module instead of KirNet for fully typed GetService().");
-	lines.push("-- All other KirNet methods (CreateSignal, RegisterService, etc.) work as normal.");
+	lines.push("-- All other KirNet methods (CreateServerSignal, RegisterService, etc.) work as normal.");
 	lines.push("");
 	lines.push(`local KirNet = require(${requirePath})`);
 	lines.push("");
@@ -37,6 +35,22 @@ export function generateTypesContent(
 	lines.push("-- KirNet types (inlined for reliable autocomplete)");
 	lines.push("-- ============================================================");
 	lines.push("");
+	lines.push("type ServerSignal<T...> = {");
+	lines.push("\tFire: (self: ServerSignal<T...>, player: Player, T...) -> (),");
+	lines.push("\tFireAll: (self: ServerSignal<T...>, T...) -> (),");
+	lines.push("\tFireExcept: (self: ServerSignal<T...>, player: Player, T...) -> (),");
+	lines.push("\tFireList: (self: ServerSignal<T...>, players: { Player }, T...) -> (),");
+	lines.push("\tConnect: (self: ServerSignal<T...>, callback: (T...) -> ()) -> (),");
+	lines.push("\tOnce: (self: ServerSignal<T...>, callback: (T...) -> ()) -> (),");
+	lines.push("\tWait: (self: ServerSignal<T...>, timeout: number?) -> T...,");
+	lines.push("\tDisconnect: (self: ServerSignal<T...>) -> (),");
+	lines.push("}");
+	lines.push("");
+	lines.push("type ClientSignal<T...> = {");
+	lines.push("\tFireServer: (self: ClientSignal<T...>, T...) -> (),");
+	lines.push("\tOnServerEvent: (self: ClientSignal<T...>, callback: (player: Player, T...) -> ()) -> (),");
+	lines.push("}");
+	lines.push("");
 	lines.push("type Signal<T...> = {");
 	lines.push("\tFire: (self: Signal<T...>, player: Player, T...) -> (),");
 	lines.push("\tFireAll: (self: Signal<T...>, T...) -> (),");
@@ -50,8 +64,8 @@ export function generateTypesContent(
 	lines.push("\tOnServerEvent: (self: Signal<T...>, callback: (player: Player, T...) -> ()) -> (),");
 	lines.push("}");
 	lines.push("");
-	lines.push("type Function<TReturn> = {");
-	lines.push("\tCall: (self: Function<TReturn>, ...any) -> TReturn,");
+	lines.push("type ServerFunction<TReturn> = {");
+	lines.push("\tCall: (self: ServerFunction<TReturn>, ...any) -> TReturn,");
 	lines.push("}");
 	lines.push("");
 
@@ -65,10 +79,13 @@ export function generateTypesContent(
 		const typeName = `${svc.name}Type`;
 		lines.push(`export type ${typeName} = {`);
 		for (const field of svc.fields) {
-			// Strip any leftover KirNet. prefix — generated file defines Signal/Function locally
+			// Strip any leftover KirNet. prefix - generated file defines types locally
 			const fieldType = field.type
+				.replace(/\bKirNet\s*\.\s*ServerSignal\s*</g, "ServerSignal<")
+				.replace(/\bKirNet\s*\.\s*ClientSignal\s*</g, "ClientSignal<")
+				.replace(/\bKirNet\s*\.\s*ServerFunction\s*</g, "ServerFunction<")
 				.replace(/\bKirNet\s*\.\s*Signal\s*</g, "Signal<")
-				.replace(/\bKirNet\s*\.\s*Function\s*</g, "Function<");
+				.replace(/\bKirNet\s*\.\s*Function\s*</g, "ServerFunction<");
 			lines.push(`\t${field.name}: ${fieldType},`);
 		}
 		lines.push("}");
@@ -77,64 +94,37 @@ export function generateTypesContent(
 
 	// -- Typed KirNet with GetService overloads
 	lines.push("-- ============================================================");
-	lines.push("-- Typed KirNet — drop-in replacement with overloaded GetService");
+	lines.push("-- Typed KirNet - drop-in replacement with overloaded GetService");
 	lines.push("-- ============================================================");
 	lines.push("");
 
-	// Build the intersection-type overload for GetService so that
-	// KirNet.GetService("CombatService") resolves to CombatServiceType, etc.
 	lines.push("type GetServiceOverloads =");
-	for (let i = 0; i < sortedServices.length; i++) {
-		const svc = sortedServices[i];
+	for (let i = 0; i < sorted.length; i++) {
+		const svc = sorted[i];
 		const prefix = i === 0 ? "\t" : "\t& ";
 		lines.push(`${prefix}((name: "${svc.name}") -> ${svc.name}Type)`);
 	}
-	const svcFallbackPrefix = sortedServices.length === 0 ? "\t" : "\t& ";
+	const svcFallbackPrefix = sorted.length === 0 ? "\t" : "\t& ";
 	lines.push(`${svcFallbackPrefix}((name: string) -> { [string]: any })`);
 	lines.push("");
 
-	// Build the intersection-type overload for GetController so that
-	// KirNet.GetController("UIController") resolves to UIControllerType, etc.
-	lines.push("type GetControllerOverloads =");
-	for (let i = 0; i < sortedControllers.length; i++) {
-		const ctrl = sortedControllers[i];
-		const prefix = i === 0 ? "\t" : "\t& ";
-		lines.push(`${prefix}((name: "${ctrl.name}") -> ${ctrl.name}Type)`);
-	}
-	const ctrlFallbackPrefix = sortedControllers.length === 0 ? "\t" : "\t& ";
-	lines.push(`${ctrlFallbackPrefix}((name: string) -> { [string]: any }?)`);
-	lines.push("");
-
-	// Build the intersection-type overload for RegisterService so that
-	// KirNet.RegisterService("GunSystem", def) resolves to GunSystemType, etc.
 	lines.push("type RegisterServiceOverloads =");
-	for (let i = 0; i < sortedServices.length; i++) {
-		const svc = sortedServices[i];
+	for (let i = 0; i < sorted.length; i++) {
+		const svc = sorted[i];
 		const prefix = i === 0 ? "\t" : "\t& ";
 		lines.push(`${prefix}((name: "${svc.name}", definition: ${svc.name}Type) -> ${svc.name}Type)`);
 	}
-	const regSvcFallbackPrefix = sortedServices.length === 0 ? "\t" : "\t& ";
-	lines.push(`${regSvcFallbackPrefix}((name: string, definition: { [string]: any }) -> { [string]: any })`);
-	lines.push("");
-
-	// Build the intersection-type overload for RegisterController so that
-	// KirNet.RegisterController("UIController", def) resolves to UIControllerType, etc.
-	lines.push("type RegisterControllerOverloads =");
-	for (let i = 0; i < sortedControllers.length; i++) {
-		const ctrl = sortedControllers[i];
-		const prefix = i === 0 ? "\t" : "\t& ";
-		lines.push(`${prefix}((name: "${ctrl.name}", definition: ${ctrl.name}Type) -> ${ctrl.name}Type)`);
-	}
-	const regCtrlFallbackPrefix = sortedControllers.length === 0 ? "\t" : "\t& ";
-	lines.push(`${regCtrlFallbackPrefix}((name: string, definition: { [string]: any }) -> { [string]: any })`);
+	const regFallbackPrefix = sorted.length === 0 ? "\t" : "\t& ";
+	lines.push(`${regFallbackPrefix}((name: string, definition: { [string]: any }) -> { [string]: any })`);
 	lines.push("");
 
 	lines.push("type TypedKirNet = {");
 	lines.push("\tGetService: GetServiceOverloads,");
-	lines.push("\tGetController: GetControllerOverloads,");
 	lines.push("\tRegisterService: RegisterServiceOverloads,");
-	lines.push("\tRegisterController: RegisterControllerOverloads,");
+	lines.push("\tCreateServerSignal: typeof(KirNet.CreateServerSignal),");
+	lines.push("\tCreateClientSignal: typeof(KirNet.CreateClientSignal),");
 	lines.push("\tCreateSignal: typeof(KirNet.CreateSignal),");
+	lines.push("\tCreateServerFunction: typeof(KirNet.CreateServerFunction),");
 	lines.push("\tCreateFunction: typeof(KirNet.CreateFunction),");
 	lines.push("\tUseMiddleware: typeof(KirNet.UseMiddleware),");
 	lines.push("\tSetDebug: typeof(KirNet.SetDebug),");

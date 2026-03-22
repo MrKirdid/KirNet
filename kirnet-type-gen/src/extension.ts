@@ -85,13 +85,11 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand("kirnet.listServices", () => listServicesCommand()),
 		vscode.commands.registerCommand("kirnet.goToService", () => goToServiceCommand()),
 		vscode.commands.registerCommand("kirnet.restorePackage", () => restorePackageCommand()),
-		vscode.commands.registerCommand("kirnet.createService", () => scaffoldCommand("service")),
-		vscode.commands.registerCommand("kirnet.createController", () => scaffoldCommand("controller")),
+		vscode.commands.registerCommand("kirnet.createService", () => scaffoldCommand()),
 	);
 
-	// Save watcher — regenerate when service/controller source files are saved
+	// Save watcher — regenerate when service source files are saved
 	const servicesAbsPath = path.resolve(workspaceRoot, config.paths.services).toLowerCase();
-	const controllersAbsPath = path.resolve(workspaceRoot, config.paths.controllers).toLowerCase();
 
 	context.subscriptions.push(
 		createSaveHandler(
@@ -102,7 +100,7 @@ export function activate(context: vscode.ExtensionContext): void {
 				if (resolvedEntry && fp === resolvedEntry.entryFile.toLowerCase()) {
 					return false;
 				}
-				return fp.startsWith(servicesAbsPath) || fp.startsWith(controllersAbsPath);
+				return fp.startsWith(servicesAbsPath);
 			},
 		),
 	);
@@ -360,18 +358,18 @@ function ensureBackup(entry: KirNetEntry): void {
 	fs.copyFileSync(entry.entryFile, backupPath);
 }
 
-function regenerate(trigger: string): void {
+async function regenerate(trigger: string): Promise<void> {
 	statusBarItem.text = "$(sync~spin) KirNet Types";
 	logger.log(`--- Regenerating (trigger: ${trigger}) ---`);
 
 	try {
 		const result = parseAll(
 			workspaceRoot,
-			[config.paths.services, config.paths.controllers],
+			[config.paths.services],
 			config.options.debug,
 		);
 
-		logger.log(`Found ${result.services.length} service(s)/controller(s)`);
+		logger.log(`Found ${result.services.length} service(s)`);
 		for (const svc of result.services) {
 			logger.log(`  ${svc.name}: ${svc.fields.map((f) => f.name).join(", ")}`);
 		}
@@ -404,7 +402,8 @@ function regenerate(trigger: string): void {
 		fs.mkdirSync(outputDir, { recursive: true });
 		const existing = fs.existsSync(outputAbsPath) ? fs.readFileSync(outputAbsPath, "utf-8") : "";
 		if (existing !== content) {
-			fs.writeFileSync(outputAbsPath, content, "utf-8");
+			const outputUri = vscode.Uri.file(outputAbsPath);
+			await vscode.workspace.fs.writeFile(outputUri, Buffer.from(content, "utf-8"));
 		}
 
 		// Update completions + diagnostics
@@ -461,45 +460,44 @@ function updateDiagnostics(result: ParseResult): void {
 
 async function listServicesCommand(): Promise<void> {
 	if (lastParsedServices.length === 0) {
-		vscode.window.showInformationMessage("No services or controllers detected yet.");
+		vscode.window.showInformationMessage("No services detected yet.");
 		return;
 	}
 
 	const items = lastParsedServices.map((svc) => ({
 		label: `$(symbol-class) ${svc.name}`,
-		description: svc.kind,
+		description: "service",
 		detail: svc.fields.map((f) => `${f.name}: ${f.type}`).join(", "),
 	}));
 
 	await vscode.window.showQuickPick(items, {
-		title: "KirNet Services & Controllers",
-		placeHolder: "Browse registered services and controllers",
+		title: "KirNet Services",
+		placeHolder: "Browse registered services",
 	});
 }
 
 async function goToServiceCommand(): Promise<void> {
 	if (lastParsedServices.length === 0) {
-		vscode.window.showInformationMessage("No services or controllers detected yet.");
+		vscode.window.showInformationMessage("No services detected yet.");
 		return;
 	}
 
 	const items = lastParsedServices.map((svc) => ({
 		label: svc.name,
-		description: `${svc.kind} — ${path.relative(workspaceRoot, svc.filePath)}`,
+		description: `service — ${path.relative(workspaceRoot, svc.filePath)}`,
 		filePath: svc.filePath,
 	}));
 
 	const picked = await vscode.window.showQuickPick(items, {
-		title: "Jump to Service/Controller Definition",
-		placeHolder: "Select a service or controller to open",
+		title: "Jump to Service Definition",
+		placeHolder: "Select a service to open",
 	});
 
 	if (picked) {
 		const doc = await vscode.workspace.openTextDocument(picked.filePath);
 		const text = doc.getText();
-		// Find the RegisterService/RegisterController line for this name
 		const registerPattern = new RegExp(
-			`(?:RegisterService|RegisterController)\\s*\\(\\s*["']${picked.label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`,
+			`RegisterService\\s*\\(\\s*["']${picked.label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`,
 		);
 		const match = registerPattern.exec(text);
 		const pos = match ? doc.positionAt(match.index) : new vscode.Position(0, 0);
@@ -552,15 +550,12 @@ async function restorePackageCommand(): Promise<void> {
 	}
 }
 
-async function scaffoldCommand(kind: "service" | "controller"): Promise<void> {
-	const label = kind === "service" ? "Service" : "Controller";
-	const registerFn = kind === "service" ? "RegisterService" : "RegisterController";
-	const dirConfigKey = kind === "service" ? config.paths.services : config.paths.controllers;
-	const dir = path.resolve(workspaceRoot, dirConfigKey);
+async function scaffoldCommand(): Promise<void> {
+	const dir = path.resolve(workspaceRoot, config.paths.services);
 
 	const name = await vscode.window.showInputBox({
-		title: `New KirNet ${label}`,
-		prompt: `Enter the ${label.toLowerCase()} name (e.g. Combat${label})`,
+		title: "New KirNet Service",
+		prompt: "Enter the service name (e.g. CombatService)",
 		validateInput: (value) => {
 			if (!value || !/^[A-Z]\w*$/.test(value)) {
 				return "Name must start with an uppercase letter and contain only word characters";
@@ -584,8 +579,9 @@ async function scaffoldCommand(kind: "service" | "controller"): Promise<void> {
 		"",
 		`local KirNet = require(game:GetService("ReplicatedStorage").Shared.Packages.kirnet)`,
 		"",
-		`KirNet.${registerFn}("${name}", {`,
-		"\tExampleSignal = KirNet.CreateSignal() :: KirNet.Signal<string>,",
+		`KirNet.RegisterService("${name}", {`,
+		"\tExampleBroadcast = KirNet.CreateServerSignal() :: KirNet.ServerSignal<string>,",
+		"\tExampleEvent = KirNet.CreateClientSignal() :: KirNet.ClientSignal<string>,",
 		"})",
 		"",
 	].join("\n");
@@ -594,7 +590,7 @@ async function scaffoldCommand(kind: "service" | "controller"): Promise<void> {
 	fs.writeFileSync(filePath, content, "utf-8");
 	const doc = await vscode.workspace.openTextDocument(filePath);
 	await vscode.window.showTextDocument(doc);
-	logger.log(`Created ${label}: ${path.relative(workspaceRoot, filePath)}`);
+	logger.log(`Created service: ${path.relative(workspaceRoot, filePath)}`);
 }
 
 export function deactivate(): void {

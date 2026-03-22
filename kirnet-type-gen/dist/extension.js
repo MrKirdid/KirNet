@@ -2040,44 +2040,6 @@ var fs3 = __toESM(require("fs"));
 var path = __toESM(require("path"));
 var fs = __toESM(require("fs"));
 var import_toml = __toESM(require_toml());
-var DEFAULTS = {
-  paths: {
-    services: "src",
-    controllers: "src",
-    output: "src/ReplicatedStorage/Shared/Packages/KirNet/Types.luau",
-    kirnet_package: ""
-  },
-  options: {
-    kirnet_require_path: 'game:GetService("ReplicatedStorage").Shared.Packages.KirNet',
-    debug: false
-  }
-};
-function readConfig(workspaceRoot2) {
-  const configPath = path.join(workspaceRoot2, "kirnet.toml");
-  if (!fs.existsSync(configPath)) {
-    return structuredClone(DEFAULTS);
-  }
-  try {
-    const raw = fs.readFileSync(configPath, "utf-8");
-    const parsed = import_toml.default.parse(raw);
-    const paths = parsed.paths ?? {};
-    const options = parsed.options ?? {};
-    return {
-      paths: {
-        services: typeof paths.services === "string" ? paths.services : DEFAULTS.paths.services,
-        controllers: typeof paths.controllers === "string" ? paths.controllers : DEFAULTS.paths.controllers,
-        output: typeof paths.output === "string" ? paths.output : DEFAULTS.paths.output,
-        kirnet_package: typeof paths.kirnet_package === "string" ? paths.kirnet_package : DEFAULTS.paths.kirnet_package
-      },
-      options: {
-        kirnet_require_path: typeof options.kirnet_require_path === "string" ? options.kirnet_require_path : DEFAULTS.options.kirnet_require_path,
-        debug: typeof options.debug === "boolean" ? options.debug : DEFAULTS.options.debug
-      }
-    };
-  } catch {
-    return structuredClone(DEFAULTS);
-  }
-}
 
 // src/logger.ts
 var vscode = __toESM(require("vscode"));
@@ -2106,6 +2068,45 @@ function debug(message, isDebug) {
 function dispose() {
   channel?.dispose();
   channel = void 0;
+}
+
+// src/config.ts
+var DEFAULTS = {
+  paths: {
+    services: "src",
+    output: "src/ReplicatedStorage/Shared/Packages/KirNet/Types.luau",
+    kirnet_package: ""
+  },
+  options: {
+    kirnet_require_path: 'game:GetService("ReplicatedStorage").Shared.Packages.KirNet',
+    debug: false
+  }
+};
+function readConfig(workspaceRoot2) {
+  const configPath = path.join(workspaceRoot2, "kirnet.toml");
+  if (!fs.existsSync(configPath)) {
+    return structuredClone(DEFAULTS);
+  }
+  try {
+    const raw = fs.readFileSync(configPath, "utf-8");
+    const parsed = import_toml.default.parse(raw);
+    const paths = parsed.paths ?? {};
+    const options = parsed.options ?? {};
+    return {
+      paths: {
+        services: typeof paths.services === "string" ? paths.services : DEFAULTS.paths.services,
+        output: typeof paths.output === "string" ? paths.output : DEFAULTS.paths.output,
+        kirnet_package: typeof paths.kirnet_package === "string" ? paths.kirnet_package : DEFAULTS.paths.kirnet_package
+      },
+      options: {
+        kirnet_require_path: typeof options.kirnet_require_path === "string" ? options.kirnet_require_path : DEFAULTS.options.kirnet_require_path,
+        debug: typeof options.debug === "boolean" ? options.debug : DEFAULTS.options.debug
+      }
+    };
+  } catch (e) {
+    warn(`Failed to parse kirnet.toml: ${e.message ?? e} \u2014 using defaults`);
+    return structuredClone(DEFAULTS);
+  }
 }
 
 // src/parser.ts
@@ -2184,13 +2185,13 @@ function parseFile(content, filePath, isDebug) {
   const warnings = [];
   const kirnetVar = detectKirNetVar(content);
   const registerPattern = new RegExp(
-    `${escapeForRegex(kirnetVar)}\\s*\\.\\s*(RegisterService|RegisterController)\\s*\\(\\s*["']([^"']+)["']\\s*,\\s*\\{`,
+    `${escapeForRegex(kirnetVar)}\\s*\\.\\s*RegisterService\\s*\\(\\s*["']([^"']+)["']\\s*,\\s*\\{`,
     "g"
   );
   let match;
   while ((match = registerPattern.exec(content)) !== null) {
-    const kind = match[1] === "RegisterService" ? "service" : "controller";
-    const serviceName = match[2];
+    const kind = "service";
+    const serviceName = match[1];
     const braceStart = match.index + match[0].length - 1;
     try {
       const tableBody = extractTableBody(content, braceStart);
@@ -2245,6 +2246,18 @@ function extractTableBody(content, bracePos) {
         };
       }
     } else if (ch === "-" && content[i + 1] === "-") {
+      if (content[i + 2] === "[") {
+        const afterDashes = content.substring(i + 2);
+        const blockOpenMatch = afterDashes.match(/^\[(=*)\[/);
+        if (blockOpenMatch) {
+          const eqs = blockOpenMatch[1];
+          const closeTag = `]${eqs}]`;
+          const closeIdx = content.indexOf(closeTag, i + 2 + blockOpenMatch[0].length);
+          if (closeIdx === -1) break;
+          i = closeIdx + closeTag.length - 1;
+          continue;
+        }
+      }
       const eol = content.indexOf("\n", i);
       if (eol === -1) {
         break;
@@ -2252,10 +2265,16 @@ function extractTableBody(content, bracePos) {
       i = eol;
     } else if (ch === '"' || ch === "'") {
       i = skipString(content, i, ch);
-    } else if (ch === "[" && content[i + 1] === "[") {
-      const end = content.indexOf("]]", i + 2);
-      if (end === -1) break;
-      i = end + 1;
+    } else if (ch === "[" && (content[i + 1] === "[" || content[i + 1] === "=")) {
+      const afterBracket = content.substring(i);
+      const longStringMatch = afterBracket.match(/^\[(=*)\[/);
+      if (longStringMatch) {
+        const eqs = longStringMatch[1];
+        const closeTag = `]${eqs}]`;
+        const closeIdx = content.indexOf(closeTag, i + longStringMatch[0].length);
+        if (closeIdx === -1) break;
+        i = closeIdx + closeTag.length - 1;
+      }
     }
   }
   return null;
@@ -2282,13 +2301,31 @@ function findMatchingParen(content, openPos) {
     } else if (ch === '"' || ch === "'") {
       i = skipString(content, i, ch);
     } else if (ch === "-" && content[i + 1] === "-") {
+      if (content[i + 2] === "[") {
+        const afterDashes = content.substring(i + 2);
+        const blockOpenMatch = afterDashes.match(/^\[(=*)\[/);
+        if (blockOpenMatch) {
+          const eqs = blockOpenMatch[1];
+          const closeTag = `]${eqs}]`;
+          const closeIdx = content.indexOf(closeTag, i + 2 + blockOpenMatch[0].length);
+          if (closeIdx === -1) break;
+          i = closeIdx + closeTag.length - 1;
+          continue;
+        }
+      }
       const eol = content.indexOf("\n", i);
       if (eol === -1) break;
       i = eol;
-    } else if (ch === "[" && content[i + 1] === "[") {
-      const end = content.indexOf("]]", i + 2);
-      if (end === -1) break;
-      i = end + 1;
+    } else if (ch === "[" && (content[i + 1] === "[" || content[i + 1] === "=")) {
+      const afterBracket = content.substring(i);
+      const longStringMatch = afterBracket.match(/^\[(=*)\[/);
+      if (longStringMatch) {
+        const eqs = longStringMatch[1];
+        const closeTag = `]${eqs}]`;
+        const closeIdx = content.indexOf(closeTag, i + longStringMatch[0].length);
+        if (closeIdx === -1) break;
+        i = closeIdx + closeTag.length - 1;
+      }
     }
   }
   return -1;
@@ -2320,20 +2357,21 @@ function parseDefinitionTable(tableBody, serviceName, filePath, bodyOffset, full
       continue;
     }
     const createSignalStart = trimmed.match(
-      new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateSignal\\s*\\(`)
+      new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerSignal|CreateClientSignal|CreateSignal)\\s*\\(`)
     );
     if (createSignalStart) {
       const fieldName = createSignalStart[1];
       const absOffset = bodyOffset + lineOffset;
-      const csIdx = fullContent.indexOf("CreateSignal", absOffset);
-      if (csIdx !== -1) {
-        const parenOpen = fullContent.indexOf("(", csIdx);
+      const csIdx = fullContent.search(new RegExp(`(?:CreateServerSignal|CreateClientSignal|CreateSignal)`, "g"));
+      const actualIdx = fullContent.indexOf("Create", absOffset);
+      if (actualIdx !== -1) {
+        const parenOpen = fullContent.indexOf("(", actualIdx);
         if (parenOpen !== -1) {
           const parenClose = findMatchingParen(fullContent, parenOpen);
           if (parenClose !== -1) {
             const afterParen = fullContent.substring(parenClose + 1);
             const castMatch = afterParen.match(
-              new RegExp(`^[\\s\\n]*::[\\s\\n]*(?:${v}[\\s\\n]*\\.[\\s\\n]*)?Signal[\\s\\n]*<`)
+              new RegExp(`^[\\s\\n]*::[\\s\\n]*(?:${v}[\\s\\n]*\\.[\\s\\n]*)?(?:ServerSignal|ClientSignal|Signal)[\\s\\n]*<`)
             );
             let signalField;
             let exprEnd;
@@ -2342,20 +2380,42 @@ function parseDefinitionTable(tableBody, serviceName, filePath, bodyOffset, full
               const angleClose = findMatchingAngle(fullContent, angleOpen);
               if (angleClose !== -1) {
                 const typeArgs = fullContent.substring(angleOpen + 1, angleClose).replace(/[\s\n]+/g, " ").trim();
-                signalField = { name: fieldName, type: `Signal<${typeArgs}>` };
+                const castText = castMatch[0];
+                let signalTypeName = "Signal";
+                if (castText.includes("ClientSignal")) {
+                  signalTypeName = "ClientSignal";
+                } else if (castText.includes("ServerSignal")) {
+                  signalTypeName = "ServerSignal";
+                } else if (castText.includes("Signal")) {
+                  const constructorText = fullContent.substring(absOffset, parenOpen);
+                  if (constructorText.includes("CreateClientSignal")) {
+                    signalTypeName = "ClientSignal";
+                  } else if (constructorText.includes("CreateServerSignal")) {
+                    signalTypeName = "ServerSignal";
+                  }
+                }
+                signalField = { name: fieldName, type: `${signalTypeName}<${typeArgs}>` };
                 exprEnd = angleClose + 1;
               } else {
-                signalField = { name: fieldName, type: "Signal<any>" };
+                const constructorText = fullContent.substring(absOffset, parenOpen);
+                let fallbackType = "Signal";
+                if (constructorText.includes("CreateClientSignal")) {
+                  fallbackType = "ClientSignal";
+                } else if (constructorText.includes("CreateServerSignal")) {
+                  fallbackType = "ServerSignal";
+                }
+                signalField = { name: fieldName, type: `${fallbackType}<any>` };
                 exprEnd = parenClose + 1;
               }
             } else {
-              signalField = { name: fieldName, type: "Signal<any>" };
-              const absLine = lineAt(fullContent, absOffset);
-              warnings.push({
-                filePath,
-                line: absLine,
-                message: `[KirNet] ${serviceName}.${fieldName} is untyped \u2014 add :: ${kirnetVar}.Signal<T>`
-              });
+              const constructorText = fullContent.substring(absOffset, parenOpen);
+              let untypedType = "Signal";
+              if (constructorText.includes("CreateClientSignal")) {
+                untypedType = "ClientSignal";
+              } else if (constructorText.includes("CreateServerSignal")) {
+                untypedType = "ServerSignal";
+              }
+              signalField = { name: fieldName, type: `${untypedType}<any>` };
               exprEnd = parenClose + 1;
             }
             fields.push(signalField);
@@ -2372,14 +2432,15 @@ function parseDefinitionTable(tableBody, serviceName, filePath, bodyOffset, full
       }
     }
     const createFuncStart = trimmed.match(
-      new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateFunction\\s*\\(`)
+      new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerFunction|CreateFunction)\\s*\\(`)
     );
     if (createFuncStart) {
       const fieldName = createFuncStart[1];
       const absOffset = bodyOffset + lineOffset;
-      const cfIdx = fullContent.indexOf("CreateFunction", absOffset);
-      if (cfIdx !== -1) {
-        const outerParenOpen = fullContent.indexOf("(", cfIdx);
+      const cfIdx = fullContent.search(new RegExp(`(?:CreateServerFunction|CreateFunction)`, "g"));
+      const actualCfIdx = fullContent.indexOf("Create", absOffset);
+      if (actualCfIdx !== -1) {
+        const outerParenOpen = fullContent.indexOf("(", actualCfIdx);
         if (outerParenOpen !== -1) {
           const outerParenClose = findMatchingParen(fullContent, outerParenOpen);
           if (outerParenClose !== -1) {
@@ -2392,15 +2453,9 @@ function parseDefinitionTable(tableBody, serviceName, filePath, bodyOffset, full
               let funcField;
               if (retMatch) {
                 const returnType = retMatch[1].replace(/\s*,?\s*$/, "").trim();
-                funcField = { name: fieldName, type: `Function<${returnType}>` };
+                funcField = { name: fieldName, type: `ServerFunction<${returnType}>` };
               } else {
-                const absLine = lineAt(fullContent, absOffset);
-                warnings.push({
-                  filePath,
-                  line: absLine,
-                  message: `[KirNet] ${serviceName}.${fieldName} has no return type annotation`
-                });
-                funcField = { name: fieldName, type: "Function<any>" };
+                funcField = { name: fieldName, type: "ServerFunction<any>" };
               }
               fields.push(funcField);
               if (isDebug) {
@@ -2494,22 +2549,33 @@ function parseDefinitionTable(tableBody, serviceName, filePath, bodyOffset, full
 }
 function parseBareFunction(name, paramsRaw, returnTypeRaw, serviceName, filePath, offsetInContent, fullContent, warnings) {
   if (!returnTypeRaw) {
-    const absLine = lineAt(fullContent, offsetInContent);
-    warnings.push({
-      filePath,
-      line: absLine,
-      message: `[KirNet] ${serviceName}.${name} has no return type annotation`
-    });
-    return { name, type: "Function<any>" };
+    return { name, type: "ServerFunction<any>" };
   }
   const returnType = returnTypeRaw.replace(/\s*,?\s*$/, "").trim();
-  return { name, type: `Function<${returnType}>` };
+  return { name, type: `ServerFunction<${returnType}>` };
 }
 function skipToMatchingEnd(lines, startLine) {
   let depth = 0;
+  let inBlockComment = false;
+  let blockCloseTag = "]]";
   for (let i = startLine; i < lines.length; i++) {
-    const stripped = lines[i].replace(/--.*$/, "").trim();
-    const words = stripped.split(/\W+/);
+    let line = lines[i];
+    if (inBlockComment) {
+      const closeIdx = line.indexOf(blockCloseTag);
+      if (closeIdx === -1) continue;
+      line = line.substring(closeIdx + blockCloseTag.length);
+      inBlockComment = false;
+    }
+    line = line.replace(/--\[(=*)\[[\s\S]*?\]\1\]/g, "");
+    const blockStart = line.match(/--\[(=*)\[/);
+    if (blockStart) {
+      line = line.substring(0, blockStart.index);
+      inBlockComment = true;
+      blockCloseTag = `]${blockStart[1]}]`;
+    }
+    const stripped = line.replace(/--.*$/, "").trim();
+    const noStrings = stripped.replace(/"[^"]*"|'[^']*'/g, "");
+    const words = noStrings.split(/\W+/);
     for (const word of words) {
       if (word === "function" || word === "if" || word === "for" || word === "while") {
         depth++;
@@ -2533,44 +2599,46 @@ function skipToMatchingEnd(lines, startLine) {
 function tryParseField(line, serviceName, filePath, offsetInContent, fullContent, warnings, kirnetVar) {
   const v = escapeForRegex(kirnetVar);
   const typedSignalMatch = line.match(
-    new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateSignal\\s*\\(.*?\\)\\s*::\\s*((?:${v}\\s*\\.\\s*)?Signal\\s*<(.+)>)\\s*,?\\s*$`)
+    new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerSignal|CreateClientSignal|CreateSignal)\\s*\\(.*?\\)\\s*::\\s*((?:${v}\\s*\\.\\s*)?(?:ServerSignal|ClientSignal|Signal)\\s*<(.+)>)\\s*,?\\s*$`)
   );
   if (typedSignalMatch) {
     const name = typedSignalMatch[1];
     const rawType = typedSignalMatch[2];
-    const type = rawType.replace(/\s+/g, " ").replace(new RegExp(`${v}\\s*\\.\\s*`, "g"), "").trim();
+    let type = rawType.replace(/\s+/g, " ").replace(new RegExp(`${v}\\s*\\.\\s*`, "g"), "").trim();
+    if (type.startsWith("Signal<")) {
+      const innerType = typedSignalMatch[3];
+      if (line.includes("CreateClientSignal")) {
+        type = `ClientSignal<${innerType}>`;
+      } else if (line.includes("CreateServerSignal")) {
+        type = `ServerSignal<${innerType}>`;
+      }
+    }
     return { name, type };
   }
   const untypedSignalMatch = line.match(
-    new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateSignal\\s*\\(.*?\\)\\s*,?\\s*$`)
+    new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerSignal|CreateClientSignal|CreateSignal)\\s*\\(.*?\\)\\s*,?\\s*$`)
   );
   if (untypedSignalMatch) {
     const name = untypedSignalMatch[1];
-    const absLine = lineAt(fullContent, offsetInContent);
-    warnings.push({
-      filePath,
-      line: absLine,
-      message: `[KirNet] ${serviceName}.${name} is untyped \u2014 add :: ${kirnetVar}.Signal<T>`
-    });
-    return { name, type: "Signal<any>" };
+    let signalKind = "Signal";
+    if (line.includes("CreateClientSignal")) {
+      signalKind = "ClientSignal";
+    } else if (line.includes("CreateServerSignal")) {
+      signalKind = "ServerSignal";
+    }
+    return { name, type: `${signalKind}<any>` };
   }
   const funcMatch = line.match(
-    new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateFunction\\s*\\(\\s*function\\s*\\((.+?)\\)`)
+    new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerFunction|CreateFunction)\\s*\\(\\s*function\\s*\\((.+?)\\)`)
   );
   if (funcMatch) {
     const name = funcMatch[1];
     const returnMatch = line.match(/\)\s*:\s*(.+?)$/);
     if (!returnMatch) {
-      const absLine = lineAt(fullContent, offsetInContent);
-      warnings.push({
-        filePath,
-        line: absLine,
-        message: `[KirNet] ${serviceName}.${name} has no return type annotation`
-      });
-      return { name, type: "Function<any>" };
+      return { name, type: "ServerFunction<any>" };
     }
     const returnType = returnMatch[1].replace(/\s*,?\s*$/, "").trim();
-    return { name, type: `Function<${returnType}>` };
+    return { name, type: `ServerFunction<${returnType}>` };
   }
   const directTypeMatch = line.match(/^(\w+)\s*:\s*(.+?)\s*,?\s*$/);
   if (directTypeMatch) {
@@ -2593,14 +2661,12 @@ function lineAt(content, offset) {
 // src/generator.ts
 function generateTypesContent(services, requirePath) {
   const sorted = [...services].sort((a, b) => a.name.localeCompare(b.name));
-  const sortedServices = sorted.filter((s) => s.kind === "service");
-  const sortedControllers = sorted.filter((s) => s.kind === "controller");
   const lines = [];
   lines.push("-- AUTO-GENERATED by KirNet Type Generator");
   lines.push("-- Do not edit manually. This file is overwritten on every save.");
   lines.push("--");
   lines.push("-- Require this module instead of KirNet for fully typed GetService().");
-  lines.push("-- All other KirNet methods (CreateSignal, RegisterService, etc.) work as normal.");
+  lines.push("-- All other KirNet methods (CreateServerSignal, RegisterService, etc.) work as normal.");
   lines.push("");
   lines.push(`local KirNet = require(${requirePath})`);
   lines.push("");
@@ -2611,6 +2677,22 @@ function generateTypesContent(services, requirePath) {
   lines.push("-- ============================================================");
   lines.push("-- KirNet types (inlined for reliable autocomplete)");
   lines.push("-- ============================================================");
+  lines.push("");
+  lines.push("type ServerSignal<T...> = {");
+  lines.push("	Fire: (self: ServerSignal<T...>, player: Player, T...) -> (),");
+  lines.push("	FireAll: (self: ServerSignal<T...>, T...) -> (),");
+  lines.push("	FireExcept: (self: ServerSignal<T...>, player: Player, T...) -> (),");
+  lines.push("	FireList: (self: ServerSignal<T...>, players: { Player }, T...) -> (),");
+  lines.push("	Connect: (self: ServerSignal<T...>, callback: (T...) -> ()) -> (),");
+  lines.push("	Once: (self: ServerSignal<T...>, callback: (T...) -> ()) -> (),");
+  lines.push("	Wait: (self: ServerSignal<T...>, timeout: number?) -> T...,");
+  lines.push("	Disconnect: (self: ServerSignal<T...>) -> (),");
+  lines.push("}");
+  lines.push("");
+  lines.push("type ClientSignal<T...> = {");
+  lines.push("	FireServer: (self: ClientSignal<T...>, T...) -> (),");
+  lines.push("	OnServerEvent: (self: ClientSignal<T...>, callback: (player: Player, T...) -> ()) -> (),");
+  lines.push("}");
   lines.push("");
   lines.push("type Signal<T...> = {");
   lines.push("	Fire: (self: Signal<T...>, player: Player, T...) -> (),");
@@ -2625,8 +2707,8 @@ function generateTypesContent(services, requirePath) {
   lines.push("	OnServerEvent: (self: Signal<T...>, callback: (player: Player, T...) -> ()) -> (),");
   lines.push("}");
   lines.push("");
-  lines.push("type Function<TReturn> = {");
-  lines.push("	Call: (self: Function<TReturn>, ...any) -> TReturn,");
+  lines.push("type ServerFunction<TReturn> = {");
+  lines.push("	Call: (self: ServerFunction<TReturn>, ...any) -> TReturn,");
   lines.push("}");
   lines.push("");
   lines.push("-- ============================================================");
@@ -2637,58 +2719,41 @@ function generateTypesContent(services, requirePath) {
     const typeName = `${svc.name}Type`;
     lines.push(`export type ${typeName} = {`);
     for (const field of svc.fields) {
-      const fieldType = field.type.replace(/\bKirNet\s*\.\s*Signal\s*</g, "Signal<").replace(/\bKirNet\s*\.\s*Function\s*</g, "Function<");
+      const fieldType = field.type.replace(/\bKirNet\s*\.\s*ServerSignal\s*</g, "ServerSignal<").replace(/\bKirNet\s*\.\s*ClientSignal\s*</g, "ClientSignal<").replace(/\bKirNet\s*\.\s*ServerFunction\s*</g, "ServerFunction<").replace(/\bKirNet\s*\.\s*Signal\s*</g, "Signal<").replace(/\bKirNet\s*\.\s*Function\s*</g, "ServerFunction<");
       lines.push(`	${field.name}: ${fieldType},`);
     }
     lines.push("}");
     lines.push("");
   }
   lines.push("-- ============================================================");
-  lines.push("-- Typed KirNet \u2014 drop-in replacement with overloaded GetService");
+  lines.push("-- Typed KirNet - drop-in replacement with overloaded GetService");
   lines.push("-- ============================================================");
   lines.push("");
   lines.push("type GetServiceOverloads =");
-  for (let i = 0; i < sortedServices.length; i++) {
-    const svc = sortedServices[i];
+  for (let i = 0; i < sorted.length; i++) {
+    const svc = sorted[i];
     const prefix = i === 0 ? "	" : "	& ";
     lines.push(`${prefix}((name: "${svc.name}") -> ${svc.name}Type)`);
   }
-  const svcFallbackPrefix = sortedServices.length === 0 ? "	" : "	& ";
+  const svcFallbackPrefix = sorted.length === 0 ? "	" : "	& ";
   lines.push(`${svcFallbackPrefix}((name: string) -> { [string]: any })`);
   lines.push("");
-  lines.push("type GetControllerOverloads =");
-  for (let i = 0; i < sortedControllers.length; i++) {
-    const ctrl = sortedControllers[i];
-    const prefix = i === 0 ? "	" : "	& ";
-    lines.push(`${prefix}((name: "${ctrl.name}") -> ${ctrl.name}Type)`);
-  }
-  const ctrlFallbackPrefix = sortedControllers.length === 0 ? "	" : "	& ";
-  lines.push(`${ctrlFallbackPrefix}((name: string) -> { [string]: any }?)`);
-  lines.push("");
   lines.push("type RegisterServiceOverloads =");
-  for (let i = 0; i < sortedServices.length; i++) {
-    const svc = sortedServices[i];
+  for (let i = 0; i < sorted.length; i++) {
+    const svc = sorted[i];
     const prefix = i === 0 ? "	" : "	& ";
     lines.push(`${prefix}((name: "${svc.name}", definition: ${svc.name}Type) -> ${svc.name}Type)`);
   }
-  const regSvcFallbackPrefix = sortedServices.length === 0 ? "	" : "	& ";
-  lines.push(`${regSvcFallbackPrefix}((name: string, definition: { [string]: any }) -> { [string]: any })`);
-  lines.push("");
-  lines.push("type RegisterControllerOverloads =");
-  for (let i = 0; i < sortedControllers.length; i++) {
-    const ctrl = sortedControllers[i];
-    const prefix = i === 0 ? "	" : "	& ";
-    lines.push(`${prefix}((name: "${ctrl.name}", definition: ${ctrl.name}Type) -> ${ctrl.name}Type)`);
-  }
-  const regCtrlFallbackPrefix = sortedControllers.length === 0 ? "	" : "	& ";
-  lines.push(`${regCtrlFallbackPrefix}((name: string, definition: { [string]: any }) -> { [string]: any })`);
+  const regFallbackPrefix = sorted.length === 0 ? "	" : "	& ";
+  lines.push(`${regFallbackPrefix}((name: string, definition: { [string]: any }) -> { [string]: any })`);
   lines.push("");
   lines.push("type TypedKirNet = {");
   lines.push("	GetService: GetServiceOverloads,");
-  lines.push("	GetController: GetControllerOverloads,");
   lines.push("	RegisterService: RegisterServiceOverloads,");
-  lines.push("	RegisterController: RegisterControllerOverloads,");
+  lines.push("	CreateServerSignal: typeof(KirNet.CreateServerSignal),");
+  lines.push("	CreateClientSignal: typeof(KirNet.CreateClientSignal),");
   lines.push("	CreateSignal: typeof(KirNet.CreateSignal),");
+  lines.push("	CreateServerFunction: typeof(KirNet.CreateServerFunction),");
   lines.push("	CreateFunction: typeof(KirNet.CreateFunction),");
   lines.push("	UseMiddleware: typeof(KirNet.UseMiddleware),");
   lines.push("	SetDebug: typeof(KirNet.SetDebug),");
@@ -2709,20 +2774,15 @@ function createCompletionProvider() {
     provideCompletionItems(document, position) {
       const lineText = document.lineAt(position).text;
       const textBeforeCursor = lineText.substring(0, position.character);
-      const pattern = /KirNet\s*[.:]\s*(GetService|GetController)\s*\(\s*["']([^"']*)$/;
+      const pattern = /KirNet\s*[.:]\s*GetService\s*\(\s*["']([^"']*)$/;
       const match = textBeforeCursor.match(pattern);
       if (!match) {
         return void 0;
       }
-      const method = match[1];
-      const query = match[2];
+      const query = match[1];
       const quoteStartPos = position.character - query.length;
-      const targetKind = method === "GetService" ? "service" : "controller";
       const items = [];
       for (const svc of knownServices) {
-        if (svc.kind !== targetKind) {
-          continue;
-        }
         if (query && !fuzzyMatch(query, svc.name)) {
           continue;
         }
@@ -2738,7 +2798,7 @@ function createCompletionProvider() {
           position.character
         );
         item.range = range;
-        item.detail = `KirNet ${svc.kind === "service" ? "Service" : "Controller"}`;
+        item.detail = `KirNet Service`;
         const docLines = svc.fields.map(
           (f) => `- \`${f.name}\`: \`${f.type}\``
         );
@@ -2798,7 +2858,7 @@ function registerCompletionProvider(context) {
 var vscode3 = __toESM(require("vscode"));
 var debounceTimer;
 function createSaveHandler(onTrigger, isInScope) {
-  return vscode3.workspace.onDidSaveTextDocument((doc) => {
+  const sub = vscode3.workspace.onDidSaveTextDocument((doc) => {
     const uri = doc.uri;
     if (!/\.luau?$/.test(uri.fsPath)) {
       return;
@@ -2814,6 +2874,15 @@ function createSaveHandler(onTrigger, isInScope) {
       onTrigger(uri);
     }, 300);
   });
+  return {
+    dispose() {
+      if (debounceTimer) {
+        clearTimeout(debounceTimer);
+        debounceTimer = void 0;
+      }
+      sub.dispose();
+    }
+  };
 }
 
 // src/extension.ts
@@ -2863,11 +2932,9 @@ function activate(context) {
     vscode4.commands.registerCommand("kirnet.listServices", () => listServicesCommand()),
     vscode4.commands.registerCommand("kirnet.goToService", () => goToServiceCommand()),
     vscode4.commands.registerCommand("kirnet.restorePackage", () => restorePackageCommand()),
-    vscode4.commands.registerCommand("kirnet.createService", () => scaffoldCommand("service")),
-    vscode4.commands.registerCommand("kirnet.createController", () => scaffoldCommand("controller"))
+    vscode4.commands.registerCommand("kirnet.createService", () => scaffoldCommand())
   );
   const servicesAbsPath = path3.resolve(workspaceRoot, config.paths.services).toLowerCase();
-  const controllersAbsPath = path3.resolve(workspaceRoot, config.paths.controllers).toLowerCase();
   context.subscriptions.push(
     createSaveHandler(
       (uri) => regenerate(`saved: ${path3.relative(workspaceRoot, uri.fsPath)}`),
@@ -2876,7 +2943,7 @@ function activate(context) {
         if (resolvedEntry && fp === resolvedEntry.entryFile.toLowerCase()) {
           return false;
         }
-        return fp.startsWith(servicesAbsPath) || fp.startsWith(controllersAbsPath);
+        return fp.startsWith(servicesAbsPath);
       }
     )
   );
@@ -3083,16 +3150,16 @@ function ensureBackup(entry) {
   log(`Backing up ${path3.basename(entry.entryFile)} \u2192 _KirNetImpl.luau`);
   fs3.copyFileSync(entry.entryFile, backupPath);
 }
-function regenerate(trigger) {
+async function regenerate(trigger) {
   statusBarItem.text = "$(sync~spin) KirNet Types";
   log(`--- Regenerating (trigger: ${trigger}) ---`);
   try {
     const result = parseAll(
       workspaceRoot,
-      [config.paths.services, config.paths.controllers],
+      [config.paths.services],
       config.options.debug
     );
-    log(`Found ${result.services.length} service(s)/controller(s)`);
+    log(`Found ${result.services.length} service(s)`);
     for (const svc of result.services) {
       log(`  ${svc.name}: ${svc.fields.map((f) => f.name).join(", ")}`);
     }
@@ -3118,7 +3185,8 @@ function regenerate(trigger) {
     fs3.mkdirSync(outputDir, { recursive: true });
     const existing = fs3.existsSync(outputAbsPath) ? fs3.readFileSync(outputAbsPath, "utf-8") : "";
     if (existing !== content) {
-      fs3.writeFileSync(outputAbsPath, content, "utf-8");
+      const outputUri = vscode4.Uri.file(outputAbsPath);
+      await vscode4.workspace.fs.writeFile(outputUri, Buffer.from(content, "utf-8"));
     }
     lastParsedServices = result.services;
     updateKnownServices(result.services);
@@ -3143,9 +3211,6 @@ function updateDiagnostics(result) {
   diagnosticCollection.clear();
   const byFile = /* @__PURE__ */ new Map();
   for (const w of result.warnings) {
-    if (!w.message.includes("Could not parse this entry")) {
-      continue;
-    }
     const uri = w.filePath;
     if (!byFile.has(uri)) {
       byFile.set(uri, []);
@@ -3165,38 +3230,38 @@ function updateDiagnostics(result) {
 }
 async function listServicesCommand() {
   if (lastParsedServices.length === 0) {
-    vscode4.window.showInformationMessage("No services or controllers detected yet.");
+    vscode4.window.showInformationMessage("No services detected yet.");
     return;
   }
   const items = lastParsedServices.map((svc) => ({
     label: `$(symbol-class) ${svc.name}`,
-    description: svc.kind,
+    description: "service",
     detail: svc.fields.map((f) => `${f.name}: ${f.type}`).join(", ")
   }));
   await vscode4.window.showQuickPick(items, {
-    title: "KirNet Services & Controllers",
-    placeHolder: "Browse registered services and controllers"
+    title: "KirNet Services",
+    placeHolder: "Browse registered services"
   });
 }
 async function goToServiceCommand() {
   if (lastParsedServices.length === 0) {
-    vscode4.window.showInformationMessage("No services or controllers detected yet.");
+    vscode4.window.showInformationMessage("No services detected yet.");
     return;
   }
   const items = lastParsedServices.map((svc) => ({
     label: svc.name,
-    description: `${svc.kind} \u2014 ${path3.relative(workspaceRoot, svc.filePath)}`,
+    description: `service \u2014 ${path3.relative(workspaceRoot, svc.filePath)}`,
     filePath: svc.filePath
   }));
   const picked = await vscode4.window.showQuickPick(items, {
-    title: "Jump to Service/Controller Definition",
-    placeHolder: "Select a service or controller to open"
+    title: "Jump to Service Definition",
+    placeHolder: "Select a service to open"
   });
   if (picked) {
     const doc = await vscode4.workspace.openTextDocument(picked.filePath);
     const text = doc.getText();
     const registerPattern = new RegExp(
-      `(?:RegisterService|RegisterController)\\s*\\(\\s*["']${picked.label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`
+      `RegisterService\\s*\\(\\s*["']${picked.label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}["']`
     );
     const match = registerPattern.exec(text);
     const pos = match ? doc.positionAt(match.index) : new vscode4.Position(0, 0);
@@ -3246,14 +3311,11 @@ async function restorePackageCommand() {
     vscode4.window.showInformationMessage("KirNet proxy file restored to original.");
   }
 }
-async function scaffoldCommand(kind) {
-  const label = kind === "service" ? "Service" : "Controller";
-  const registerFn = kind === "service" ? "RegisterService" : "RegisterController";
-  const dirConfigKey = kind === "service" ? config.paths.services : config.paths.controllers;
-  const dir = path3.resolve(workspaceRoot, dirConfigKey);
+async function scaffoldCommand() {
+  const dir = path3.resolve(workspaceRoot, config.paths.services);
   const name = await vscode4.window.showInputBox({
-    title: `New KirNet ${label}`,
-    prompt: `Enter the ${label.toLowerCase()} name (e.g. Combat${label})`,
+    title: "New KirNet Service",
+    prompt: "Enter the service name (e.g. CombatService)",
     validateInput: (value) => {
       if (!value || !/^[A-Z]\w*$/.test(value)) {
         return "Name must start with an uppercase letter and contain only word characters";
@@ -3274,8 +3336,9 @@ async function scaffoldCommand(kind) {
     "",
     `local KirNet = require(game:GetService("ReplicatedStorage").Shared.Packages.kirnet)`,
     "",
-    `KirNet.${registerFn}("${name}", {`,
-    "	ExampleSignal = KirNet.CreateSignal() :: KirNet.Signal<string>,",
+    `KirNet.RegisterService("${name}", {`,
+    "	ExampleBroadcast = KirNet.CreateServerSignal() :: KirNet.ServerSignal<string>,",
+    "	ExampleEvent = KirNet.CreateClientSignal() :: KirNet.ClientSignal<string>,",
     "})",
     ""
   ].join("\n");
@@ -3283,7 +3346,7 @@ async function scaffoldCommand(kind) {
   fs3.writeFileSync(filePath, content, "utf-8");
   const doc = await vscode4.workspace.openTextDocument(filePath);
   await vscode4.window.showTextDocument(doc);
-  log(`Created ${label}: ${path3.relative(workspaceRoot, filePath)}`);
+  log(`Created service: ${path3.relative(workspaceRoot, filePath)}`);
 }
 function deactivate() {
   dispose();

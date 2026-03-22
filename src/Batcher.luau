@@ -14,6 +14,7 @@ local Batcher = {}
 
 export type BatchEntry = {
 	id: number,
+	flags: number,
 	payload: buffer,
 	targets: { Player }?, -- nil = FireAll, empty = specific list
 	excludePlayer: Player?, -- for FireExcept

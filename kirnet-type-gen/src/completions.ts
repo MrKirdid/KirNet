@@ -16,27 +16,20 @@ export function createCompletionProvider(): vscode.CompletionItemProvider {
 			const lineText = document.lineAt(position).text;
 			const textBeforeCursor = lineText.substring(0, position.character);
 
-			// Check if we're inside a KirNet.GetService / KirNet:GetService or GetController string argument
-			const pattern = /KirNet\s*[.:]\s*(GetService|GetController)\s*\(\s*["']([^"']*)$/;
+			// Check if we're inside a KirNet.GetService / KirNet:GetService string argument
+			const pattern = /KirNet\s*[.:]\s*GetService\s*\(\s*["']([^"']*)$/;
 			const match = textBeforeCursor.match(pattern);
 			if (!match) {
 				return undefined;
 			}
 
-			const method = match[1] as "GetService" | "GetController";
-			const query = match[2]; // partial string typed so far
+			const query = match[1]; // partial string typed so far
 			const quoteStartPos = position.character - query.length;
-
-			// Filter to the matching kind
-			const targetKind = method === "GetService" ? "service" : "controller";
 
 			// Build completion items
 			const items: vscode.CompletionItem[] = [];
 
 			for (const svc of knownServices) {
-				if (svc.kind !== targetKind) {
-					continue;
-				}
 				if (query && !fuzzyMatch(query, svc.name)) {
 					continue;
 				}
@@ -57,7 +50,7 @@ export function createCompletionProvider(): vscode.CompletionItemProvider {
 				);
 				item.range = range;
 
-				item.detail = `KirNet ${svc.kind === "service" ? "Service" : "Controller"}`;
+				item.detail = `KirNet Service`;
 
 				const docLines = svc.fields.map(
 					(f) => `- \`${f.name}\`: \`${f.type}\``,

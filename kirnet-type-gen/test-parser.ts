@@ -119,7 +119,7 @@ KirNet.RegisterService("Svc8", {
 })
 `,
 		expectedServices: [
-			{ name: "Svc8", fields: [{ name: "GetCoins", type: "Function<number>" }] },
+			{ name: "Svc8", fields: [{ name: "GetCoins", type: "ServerFunction<number>" }] },
 		],
 	},
 	// ─── FUNCTION WITH EXTRA PARAMS ──────────────────────────────────────────
@@ -136,7 +136,7 @@ KirNet.RegisterService("Svc9", {
 		expectedServices: [
 			{
 				name: "Svc9",
-				fields: [{ name: "SetName", type: "Function<boolean>" }],
+				fields: [{ name: "SetName", type: "ServerFunction<boolean>" }],
 			},
 		],
 	},
@@ -157,7 +157,7 @@ KirNet.RegisterService("GameService", {
 				name: "GameService",
 				fields: [
 					{ name: "OnDeath", type: "Signal<Player>" },
-					{ name: "GetHealth", type: "Function<number>" },
+					{ name: "GetHealth", type: "ServerFunction<number>" },
 				],
 			},
 		],
@@ -181,7 +181,7 @@ KirNet.RegisterService("DataService", {
 				name: "DataService",
 				fields: [
 					{ name: "OnDataChanged", type: "Signal<string, any>" },
-					{ name: "GetData", type: "Function<any>" },
+					{ name: "GetData", type: "ServerFunction<any>" },
 				],
 			},
 		],
@@ -200,7 +200,7 @@ KirNet.RegisterService("UtilService", {
 		expectedServices: [
 			{
 				name: "UtilService",
-				fields: [{ name: "DoThing", type: "Function<string>" }],
+				fields: [{ name: "DoThing", type: "ServerFunction<string>" }],
 			},
 		],
 	},
@@ -254,19 +254,27 @@ KirNet.RegisterService("SvcEmpty", {
 			},
 		],
 	},
-	// ─── RegisterController (same parsing) ───────────────────────────────────
+	// ─── New API: CreateServerSignal / CreateClientSignal / CreateServerFunction ──
 	{
-		name: "RegisterController with signal",
+		name: "new API: CreateServerSignal, CreateClientSignal, CreateServerFunction",
 		input: `
 local KirNet = require(game.ReplicatedStorage.KirNet)
-KirNet.RegisterController("MyController", {
-	OnReady = KirNet.CreateSignal() :: KirNet.Signal<boolean>,
+KirNet.RegisterService("NewApiService", {
+	OnData = KirNet.CreateServerSignal() :: KirNet.ServerSignal<string>,
+	OnInput = KirNet.CreateClientSignal() :: KirNet.ClientSignal<number>,
+	GetInfo = KirNet.CreateServerFunction(function(player: Player): boolean
+		return true
+	end),
 })
 `,
 		expectedServices: [
 			{
-				name: "MyController",
-				fields: [{ name: "OnReady", type: "Signal<boolean>" }],
+				name: "NewApiService",
+				fields: [
+					{ name: "OnData", type: "ServerSignal<string>" },
+					{ name: "OnInput", type: "ClientSignal<number>" },
+					{ name: "GetInfo", type: "ServerFunction<boolean>" },
+				],
 			},
 		],
 	},
@@ -343,7 +351,7 @@ KirNet.RegisterService("SvcNoParam", {
 		expectedServices: [
 			{
 				name: "SvcNoParam",
-				fields: [{ name: "Ping", type: "Function<boolean>" }],
+				fields: [{ name: "Ping", type: "ServerFunction<boolean>" }],
 			},
 		],
 	},
@@ -371,8 +379,8 @@ KirNet.RegisterService("BigService", {
 					{ name: "OnJoin", type: "Signal<Player>" },
 					{ name: "OnLeave", type: "Signal<Player>" },
 					{ name: "OnChat", type: "Signal<string>" },
-					{ name: "GetPlayerData", type: "Function<any>" },
-					{ name: "SetPlayerData", type: "Function<boolean>" },
+					{ name: "GetPlayerData", type: "ServerFunction<any>" },
+					{ name: "SetPlayerData", type: "ServerFunction<boolean>" },
 				],
 			},
 		],
@@ -430,7 +438,7 @@ KirNet.RegisterService("SvcVariadic1", {
 		expectedServices: [
 			{
 				name: "SvcVariadic1",
-				fields: [{ name: "FireGun", type: "Function<boolean>" }],
+				fields: [{ name: "FireGun", type: "ServerFunction<boolean>" }],
 			},
 		],
 	},
@@ -448,7 +456,7 @@ KirNet.RegisterService("SvcVariadic2", {
 		expectedServices: [
 			{
 				name: "SvcVariadic2",
-				fields: [{ name: "FireGun", type: "Function<boolean>" }],
+				fields: [{ name: "FireGun", type: "ServerFunction<boolean>" }],
 			},
 		],
 	},
@@ -466,7 +474,7 @@ KirNet.RegisterService("SvcVariadic3", {
 		expectedServices: [
 			{
 				name: "SvcVariadic3",
-				fields: [{ name: "DoStuff", type: "Function<string>" }],
+				fields: [{ name: "DoStuff", type: "ServerFunction<string>" }],
 			},
 		],
 	},
@@ -581,18 +589,26 @@ console.log(generated);
 
 // Verify the generated output contains the right type definitions
 const checks = [
+	["ServerSignal<T...> type def", /type ServerSignal<T\.\.\.> = \{/],
+	["ClientSignal<T...> type def", /type ClientSignal<T\.\.\.> = \{/],
 	["Signal<T...> type def", /type Signal<T\.\.\.> = \{/],
-	["Function<TReturn> type def", /type Function<TReturn> = \{/],
+	["ServerFunction<TReturn> type def", /type ServerFunction<TReturn> = \{/],
+	["ServerSignal.Fire method", /Fire: \(self: ServerSignal<T\.\.\.>, player: Player, T\.\.\.\) -> \(\)/],
+	["ServerSignal.Connect method", /Connect: \(self: ServerSignal<T\.\.\.>, callback: \(T\.\.\.\) -> \(\)\) -> \(\)/],
+	["ClientSignal.OnServerEvent method", /OnServerEvent: \(self: ClientSignal<T\.\.\.>, callback: \(player: Player, T\.\.\.\) -> \(\)\) -> \(\)/],
 	["Signal.Fire method", /Fire: \(self: Signal<T\.\.\.>, player: Player, T\.\.\.\) -> \(\)/],
+	["Signal.FireServer method", /FireServer: \(self: Signal<T\.\.\.>, T\.\.\.\) -> \(\)/],
 	["Signal.Connect method", /Connect: \(self: Signal<T\.\.\.>, callback: \(T\.\.\.\) -> \(\)\) -> \(\)/],
 	["Signal.OnServerEvent method", /OnServerEvent: \(self: Signal<T\.\.\.>, callback: \(player: Player, T\.\.\.\) -> \(\)\) -> \(\)/],
-	["Function.Call method", /Call: \(self: Function<TReturn>, \.\.\.any\) -> TReturn/],
+	["ServerFunction.Call method", /Call: \(self: ServerFunction<TReturn>, \.\.\.any\) -> TReturn/],
 	["CombatServiceType export", /export type CombatServiceType = \{/],
 	["OnDamage typed as Signal<number>", /OnDamage: Signal<number>/],
 	["OnDeath typed as Signal<Player>", /OnDeath: Signal<Player>/],
-	["GetHealth typed correctly", /GetHealth: Function<number>/],
-	["SetHealth typed correctly", /SetHealth: Function<boolean>/],
+	["GetHealth typed correctly", /GetHealth: ServerFunction<number>/],
+	["SetHealth typed correctly", /SetHealth: ServerFunction<boolean>/],
 	["TypedKirNet type", /type TypedKirNet = \{/],
+	["CreateSignal in TypedKirNet", /CreateSignal: typeof\(KirNet\.CreateSignal\)/],
+	["CreateFunction in TypedKirNet", /CreateFunction: typeof\(KirNet\.CreateFunction\)/],
 	["GetService overload for CombatService", /\(\(name: "CombatService"\) -> CombatServiceType\)/],
 	["GetService fallback overload", /\(\(name: string\) -> \{ \[string\]: any \}\)/],
 	["RegisterService overload for CombatService", /\(\(name: "CombatService", definition: CombatServiceType\) -> CombatServiceType\)/],

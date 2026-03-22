@@ -5,7 +5,7 @@ A VS Code extension that gives developers full autocomplete and type safety when
 ## Features
 
 ### Automatic `Types.luau` Generation
-Scans your service and controller files, extracts signal/function definitions, and generates a fully typed wrapper that `luau-lsp` can statically analyse.
+Scans your service files, extracts signal/function definitions, and generates a fully typed wrapper that `luau-lsp` can statically analyse.
 
 ### `GetService` String Completion
 When typing `KirNet.GetService("`)`, all registered service names appear as fuzzy-matched suggestions inside the string literal.
@@ -17,7 +17,6 @@ Create a `kirnet.toml` in your workspace root (all fields optional):
 ```toml
 [paths]
 services    = "src/ServerScriptService/Services"
-controllers = "src/StarterPlayerScripts/Controllers"
 output      = "src/ReplicatedStorage/Shared/Packages/KirNet/Types.luau"
 
 [options]

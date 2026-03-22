@@ -51,7 +51,7 @@ export interface ServiceDef {
 	name: string;
 	fields: FieldDef[];
 	filePath: string;
-	kind: "service" | "controller";
+	kind: "service";
 }
 
 export interface ParseResult {
@@ -67,7 +67,7 @@ export interface ParseWarning {
 
 /**
  * Scan all .luau/.lua files under the given directories and extract
- * KirNet.RegisterService / KirNet.RegisterController definitions.
+ * KirNet.RegisterService definitions.
  */
 export function parseAll(
 	workspaceRoot: string,
@@ -120,7 +120,7 @@ function collectLuauFiles(dir: string): string[] {
 }
 
 /**
- * Parse a single file for RegisterService / RegisterController calls.
+ * Parse a single file for RegisterService calls.
  */
 export function parseFile(
 	content: string,
@@ -133,16 +133,16 @@ export function parseFile(
 	// Detect the variable name used for KirNet (e.g. KirNet, Kirnet, kirnet)
 	const kirnetVar = detectKirNetVar(content);
 
-	// Match VarName.RegisterService("Name", { ... }) and VarName.RegisterController("Name", { ... })
+	// Match VarName.RegisterService("Name", { ... })
 	const registerPattern = new RegExp(
-		`${escapeForRegex(kirnetVar)}\\s*\\.\\s*(RegisterService|RegisterController)\\s*\\(\\s*["']([^"']+)["']\\s*,\\s*\\{`,
+		`${escapeForRegex(kirnetVar)}\\s*\\.\\s*RegisterService\\s*\\(\\s*["']([^"']+)["']\\s*,\\s*\\{`,
 		"g",
 	);
 
 	let match: RegExpExecArray | null;
 	while ((match = registerPattern.exec(content)) !== null) {
-		const kind: "service" | "controller" = match[1] === "RegisterService" ? "service" : "controller";
-		const serviceName = match[2];
+		const kind: "service" = "service";
+		const serviceName = match[1];
 		const braceStart = match.index + match[0].length - 1; // points at the {
 
 		try {
@@ -357,22 +357,23 @@ function parseDefinitionTable(
 			continue;
 		}
 
-		// ── CreateSignal: check fullContent-based first (handles multi-line + single-line) ──
+		// ── CreateServerSignal / CreateClientSignal / CreateSignal: check fullContent-based first ──
 		const createSignalStart = trimmed.match(
-			new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateSignal\\s*\\(`),
+			new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerSignal|CreateClientSignal|CreateSignal)\\s*\\(`),
 		);
 		if (createSignalStart) {
 			const fieldName = createSignalStart[1];
 			const absOffset = bodyOffset + lineOffset;
-			const csIdx = fullContent.indexOf("CreateSignal", absOffset);
-			if (csIdx !== -1) {
-				const parenOpen = fullContent.indexOf("(", csIdx);
+			const csIdx = fullContent.search(new RegExp(`(?:CreateServerSignal|CreateClientSignal|CreateSignal)`, "g"));
+			const actualIdx = fullContent.indexOf("Create", absOffset);
+			if (actualIdx !== -1) {
+				const parenOpen = fullContent.indexOf("(", actualIdx);
 				if (parenOpen !== -1) {
 					const parenClose = findMatchingParen(fullContent, parenOpen);
 					if (parenClose !== -1) {
 						const afterParen = fullContent.substring(parenClose + 1);
 						const castMatch = afterParen.match(
-							new RegExp(`^[\\s\\n]*::[\\s\\n]*(?:${v}[\\s\\n]*\\.[\\s\\n]*)?Signal[\\s\\n]*<`),
+							new RegExp(`^[\\s\\n]*::[\\s\\n]*(?:${v}[\\s\\n]*\\.[\\s\\n]*)?(?:ServerSignal|ClientSignal|Signal)[\\s\\n]*<`),
 						);
 
 						let signalField: FieldDef;
@@ -386,20 +387,45 @@ function parseDefinitionTable(
 									.substring(angleOpen + 1, angleClose)
 									.replace(/[\s\n]+/g, " ")
 									.trim();
-								signalField = { name: fieldName, type: `Signal<${typeArgs}>` };
+								// Determine signal type from the cast or the constructor name
+								const castText = castMatch[0];
+								let signalTypeName = "Signal";
+								if (castText.includes("ClientSignal")) {
+									signalTypeName = "ClientSignal";
+								} else if (castText.includes("ServerSignal")) {
+									signalTypeName = "ServerSignal";
+								} else if (castText.includes("Signal")) {
+									// Signal<T> cast — infer direction from constructor if specified
+									const constructorText = fullContent.substring(absOffset, parenOpen);
+									if (constructorText.includes("CreateClientSignal")) {
+										signalTypeName = "ClientSignal";
+									} else if (constructorText.includes("CreateServerSignal")) {
+										signalTypeName = "ServerSignal";
+									}
+								}
+								signalField = { name: fieldName, type: `${signalTypeName}<${typeArgs}>` };
 								exprEnd = angleClose + 1;
 							} else {
-								signalField = { name: fieldName, type: "Signal<any>" };
+								// Determine from constructor name
+								const constructorText = fullContent.substring(absOffset, parenOpen);
+								let fallbackType = "Signal";
+								if (constructorText.includes("CreateClientSignal")) {
+									fallbackType = "ClientSignal";
+								} else if (constructorText.includes("CreateServerSignal")) {
+									fallbackType = "ServerSignal";
+								}
+								signalField = { name: fieldName, type: `${fallbackType}<any>` };
 								exprEnd = parenClose + 1;
 							}
 						} else {
-							signalField = { name: fieldName, type: "Signal<any>" };
-							const absLine = lineAt(fullContent, absOffset);
-							warnings.push({
-								filePath,
-								line: absLine,
-								message: `[KirNet] ${serviceName}.${fieldName} is untyped — add :: ${kirnetVar}.Signal<T>`,
-							});
+							const constructorText = fullContent.substring(absOffset, parenOpen);
+							let untypedType = "Signal";
+							if (constructorText.includes("CreateClientSignal")) {
+								untypedType = "ClientSignal";
+							} else if (constructorText.includes("CreateServerSignal")) {
+								untypedType = "ServerSignal";
+							}
+							signalField = { name: fieldName, type: `${untypedType}<any>` };
 							exprEnd = parenClose + 1;
 						}
 
@@ -418,16 +444,17 @@ function parseDefinitionTable(
 			}
 		}
 
-		// ── CreateFunction: check fullContent-based (handles multi-line) ──
+		// ── CreateServerFunction / CreateFunction: check fullContent-based (handles multi-line) ──
 		const createFuncStart = trimmed.match(
-			new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateFunction\\s*\\(`),
+			new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerFunction|CreateFunction)\\s*\\(`),
 		);
 		if (createFuncStart) {
 			const fieldName = createFuncStart[1];
 			const absOffset = bodyOffset + lineOffset;
-			const cfIdx = fullContent.indexOf("CreateFunction", absOffset);
-			if (cfIdx !== -1) {
-				const outerParenOpen = fullContent.indexOf("(", cfIdx);
+			const cfIdx = fullContent.search(new RegExp(`(?:CreateServerFunction|CreateFunction)`, "g"));
+			const actualCfIdx = fullContent.indexOf("Create", absOffset);
+			if (actualCfIdx !== -1) {
+				const outerParenOpen = fullContent.indexOf("(", actualCfIdx);
 				if (outerParenOpen !== -1) {
 					const outerParenClose = findMatchingParen(fullContent, outerParenOpen);
 					if (outerParenClose !== -1) {
@@ -442,15 +469,9 @@ function parseDefinitionTable(
 							let funcField: FieldDef;
 							if (retMatch) {
 								const returnType = retMatch[1].replace(/\s*,?\s*$/, "").trim();
-								funcField = { name: fieldName, type: `Function<${returnType}>` };
+								funcField = { name: fieldName, type: `ServerFunction<${returnType}>` };
 							} else {
-								const absLine = lineAt(fullContent, absOffset);
-								warnings.push({
-									filePath,
-									line: absLine,
-									message: `[KirNet] ${serviceName}.${fieldName} has no return type annotation`,
-								});
-								funcField = { name: fieldName, type: "Function<any>" };
+								funcField = { name: fieldName, type: "ServerFunction<any>" };
 							}
 							fields.push(funcField);
 							if (isDebug) {
@@ -574,17 +595,11 @@ function parseBareFunction(
 	warnings: ParseWarning[],
 ): FieldDef | null {
 	if (!returnTypeRaw) {
-		const absLine = lineAt(fullContent, offsetInContent);
-		warnings.push({
-			filePath,
-			line: absLine,
-			message: `[KirNet] ${serviceName}.${name} has no return type annotation`,
-		});
-		return { name, type: "Function<any>" };
+		return { name, type: "ServerFunction<any>" };
 	}
 
 	const returnType = returnTypeRaw.replace(/\s*,?\s*$/, "").trim();
-	return { name, type: `Function<${returnType}>` };
+	return { name, type: `ServerFunction<${returnType}>` };
 }
 
 /**
@@ -648,36 +663,46 @@ function tryParseField(
 ): FieldDef | null {
 	const v = escapeForRegex(kirnetVar);
 
-	// Case 1/2: Typed signal — KeyName = VarName.CreateSignal(...) :: [VarName.]Signal<T>
+	// Case 1/2: Typed signal — KeyName = VarName.Create(Server|Client)Signal(...) :: [VarName.](Server|Client)Signal<T>
 	const typedSignalMatch = line.match(
-		new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateSignal\\s*\\(.*?\\)\\s*::\\s*((?:${v}\\s*\\.\\s*)?Signal\\s*<(.+)>)\\s*,?\\s*$`),
+		new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerSignal|CreateClientSignal|CreateSignal)\\s*\\(.*?\\)\\s*::\\s*((?:${v}\\s*\\.\\s*)?(?:ServerSignal|ClientSignal|Signal)\\s*<(.+)>)\\s*,?\\s*$`),
 	);
 	if (typedSignalMatch) {
 		const name = typedSignalMatch[1];
 		const rawType = typedSignalMatch[2];
-		// Normalize whitespace and strip module prefix so generated type uses local Signal<T>
-		const type = rawType.replace(/\s+/g, " ").replace(new RegExp(`${v}\\s*\\.\\s*`, "g"), "").trim();
+		// Normalize whitespace and strip module prefix
+		let type = rawType.replace(/\s+/g, " ").replace(new RegExp(`${v}\\s*\\.\\s*`, "g"), "").trim();
+		// If cast used Signal<T>, infer direction from constructor
+		if (type.startsWith("Signal<")) {
+			const innerType = typedSignalMatch[3];
+			if (line.includes("CreateClientSignal")) {
+				type = `ClientSignal<${innerType}>`;
+			} else if (line.includes("CreateServerSignal")) {
+				type = `ServerSignal<${innerType}>`;
+			}
+			// else keep as Signal<T> (bidirectional)
+		}
 		return { name, type };
 	}
 
-	// Case 3: Untyped signal — KeyName = VarName.CreateSignal(...)
+	// Case 3: Untyped signal — KeyName = VarName.Create(Server|Client)Signal(...)
 	const untypedSignalMatch = line.match(
-		new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateSignal\\s*\\(.*?\\)\\s*,?\\s*$`),
+		new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerSignal|CreateClientSignal|CreateSignal)\\s*\\(.*?\\)\\s*,?\\s*$`),
 	);
 	if (untypedSignalMatch) {
 		const name = untypedSignalMatch[1];
-		const absLine = lineAt(fullContent, offsetInContent);
-		warnings.push({
-			filePath,
-			line: absLine,
-			message: `[KirNet] ${serviceName}.${name} is untyped — add :: ${kirnetVar}.Signal<T>`,
-		});
-		return { name, type: "Signal<any>" };
+		let signalKind = "Signal";
+		if (line.includes("CreateClientSignal")) {
+			signalKind = "ClientSignal";
+		} else if (line.includes("CreateServerSignal")) {
+			signalKind = "ServerSignal";
+		}
+		return { name, type: `${signalKind}<any>` };
 	}
 
-	// Case 4/5/6: Function — KeyName = VarName.CreateFunction(function(player: Player, ...) : ReturnType
+	// Case 4/5/6: Function — KeyName = VarName.Create(Server)Function(function(player: Player, ...) : ReturnType
 	const funcMatch = line.match(
-		new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateFunction\\s*\\(\\s*function\\s*\\((.+?)\\)`),
+		new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerFunction|CreateFunction)\\s*\\(\\s*function\\s*\\((.+?)\\)`),
 	);
 	if (funcMatch) {
 		const name = funcMatch[1];
@@ -685,17 +710,11 @@ function tryParseField(
 		// Look for return type annotation: everything after ): up to the newline
 		const returnMatch = line.match(/\)\s*:\s*(.+?)$/);
 		if (!returnMatch) {
-			const absLine = lineAt(fullContent, offsetInContent);
-			warnings.push({
-				filePath,
-				line: absLine,
-				message: `[KirNet] ${serviceName}.${name} has no return type annotation`,
-			});
-			return { name, type: "Function<any>" };
+			return { name, type: "ServerFunction<any>" };
 		}
 
 		const returnType = returnMatch[1].replace(/\s*,?\s*$/, "").trim();
-		return { name, type: `Function<${returnType}>` };
+		return { name, type: `ServerFunction<${returnType}>` };
 	}
 
 	// Case 7: Direct type annotation — KeyName: SomeType,

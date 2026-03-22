@@ -1,6 +1,6 @@
 [package]
 name = "mrkirdid/kirnet"
-version = "1.0.4"
+version = "1.9.2"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 exclude = [

@@ -34,11 +34,11 @@
 			},
 			{
 				"command": "kirnet.listServices",
-				"title": "KirNet: List Services & Controllers"
+				"title": "KirNet: List Services"
 			},
 			{
 				"command": "kirnet.goToService",
-				"title": "KirNet: Go to Service/Controller Definition"
+				"title": "KirNet: Go to Service Definition"
 			},
 			{
 				"command": "kirnet.restorePackage",
@@ -47,10 +47,6 @@
 			{
 				"command": "kirnet.createService",
 				"title": "KirNet: Create New Service"
-			},
-			{
-				"command": "kirnet.createController",
-				"title": "KirNet: Create New Controller"
 			}
 		]
 	},

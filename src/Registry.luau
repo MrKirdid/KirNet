@@ -1,10 +1,13 @@
---!strict
+﻿--!strict
 
 --[[
-	Registry.luau — Stores registered services/controllers and their remotes.
+	Registry.luau - Stores registered services and their remotes.
 
 	Server: creates remotes, registers services, replicates routing table.
 	Client: receives routing table, resolves GetService calls.
+
+	Services are the only top-level network contract concept.
+	No controllers exist. All networking flows through services.
 ]]
 
 local Players = game:GetService("Players")
@@ -21,11 +24,8 @@ local IS_SERVER = RunService:IsServer()
 
 local Registry = {}
 
--- Registered services: name → { [methodName]: SignalImpl | FunctionImpl }
+-- Registered services: name -> { [methodName]: SignalImpl | FunctionImpl }
 local _services: { [string]: { [string]: any } } = {}
-
--- Registered controllers (client-side): name → { [methodName]: SignalImpl | FunctionImpl }
-local _controllers: { [string]: { [string]: any } } = {}
 
 -- Threads waiting for a service to be registered (client-side)
 local _waitingForService: { [string]: { thread } } = {}
@@ -33,7 +33,7 @@ local _waitingForService: { [string]: { thread } } = {}
 -- Whether the client has received the routing table
 local _clientReady = false
 
--- Route type map: routeId → "signal" | "function" (client-side, received from server)
+-- Route type map: routeId -> MemberKind (client-side, received from server)
 local _routeTypes: { [number]: string } = {}
 
 -- The container folder for KirNet remotes
@@ -42,7 +42,7 @@ local FOLDER_NAME = "__KirNet"
 -- Remote instances
 local _remoteEvent: RemoteEvent? = nil
 local _remoteFunction: RemoteFunction? = nil
-local _routingRemote: RemoteEvent? = nil -- server→client routing table replication
+local _routingRemote: RemoteEvent? = nil
 
 local _debugEnabled = false
 
@@ -102,7 +102,7 @@ local function ensureRemotes()
 	end
 end
 
--- Lookup table: routeId → SignalImpl/FunctionImpl
+-- Lookup table: routeId -> SignalImpl/FunctionImpl
 local _routeHandlers: { [number]: any } = {}
 
 local function setupServerListeners()
@@ -120,14 +120,12 @@ local function setupServerListeners()
 			end
 			local pkt = data :: buffer
 
-			-- Check for batch
 			if Signal.isBatch(pkt) then
 				local packets = Signal.parseBatch(pkt)
 				for _, subPkt in packets do
 					local routeId, _, payload = Signal.parsePacket(subPkt)
 					local handler = _routeHandlers[routeId]
 					if handler and handler._callbacks then
-						-- Rate limit check
 						if handler._checkRate and not handler:_checkRate(player) then
 							continue
 						end
@@ -174,11 +172,10 @@ local function setupClientListeners()
 	if routingRemote then
 		routingRemote.OnClientEvent:Connect(function(data: any)
 			if typeof(data) == "table" then
-				-- Routing table received
 				local routingTable = data :: { [string]: any }
 				local serviceNames = routingTable._services :: { [string]: { [string]: number } }?
 				if serviceNames then
-					-- Import route types
+					-- Import route types (memberKind info)
 					local types = routingTable._types :: { [string]: string }?
 					if types then
 						for routeIdStr, typ in types do
@@ -259,7 +256,6 @@ local function replicateRoutingTable(player: Player?)
 		return
 	end
 
-	-- Build service routing data
 	local serviceData: { [string]: { [string]: number } } = {}
 	local typeData: { [string]: string } = {}
 	for serviceName, methods in _services do
@@ -267,7 +263,21 @@ local function replicateRoutingTable(player: Player?)
 		for methodName, impl in methods do
 			if impl._id then
 				serviceData[serviceName][methodName] = impl._id
-				typeData[tostring(impl._id)] = if impl._callbacks then "signal" else "function"
+				-- Determine member kind for type info
+				local memberKind: string
+				if impl._callbacks then
+					-- It's a signal
+					if impl._kind == "server" then
+						memberKind = "serverSignal"
+					elseif impl._kind == "signal" then
+						memberKind = "signal"
+					else
+						memberKind = "clientSignal"
+					end
+				else
+					memberKind = "serverFunction"
+				end
+				typeData[tostring(impl._id)] = memberKind
 			end
 		end
 	end
@@ -281,16 +291,55 @@ local function replicateRoutingTable(player: Player?)
 	end
 end
 
+--- Validate that all members in a service definition are valid KirNet objects.
+local function validateServiceDefinition(name: string, definition: { [string]: any })
+	for methodName, impl in definition do
+		if typeof(methodName) ~= "string" then
+			error(string.format('[KirNet] Service "%s" has a non-string method key: %s', name, tostring(methodName)))
+		end
+
+		-- Check that it's a KirNet signal or function (has _init method from metatable)
+		local mt = getmetatable(impl)
+		if not mt then
+			error(
+				string.format(
+					'[KirNet] Service "%s".%s is not a valid KirNet member. Use CreateServerSignal(), CreateClientSignal(), or CreateServerFunction() to create members.',
+					name,
+					methodName
+				)
+			)
+		end
+
+		-- Verify it has _init (signals and functions both have this)
+		if typeof(impl._init) ~= "function" then
+			error(
+				string.format(
+					'[KirNet] Service "%s".%s is not a valid KirNet member. Expected a signal or function created via KirNet API.',
+					name,
+					methodName
+				)
+			)
+		end
+	end
+end
+
 function Registry.registerService(name: string, definition: { [string]: any }): { [string]: any }
 	if not IS_SERVER then
-		warn(
-			string.format(
-				'[KirNet] WARNING: RegisterService("%s") called on client — skipping. Did you mean RegisterController?',
-				name
-			)
-		)
-		return definition
+		error(string.format('[KirNet] RegisterService("%s") can only be called on the server.', name))
 	end
+
+	if _services[name] then
+		error(
+			string.format('[KirNet] Service "%s" is already registered. Duplicate service names are not allowed.', name)
+		)
+	end
+
+	if typeof(name) ~= "string" or #name == 0 then
+		error("[KirNet] Service name must be a non-empty string.")
+	end
+
+	-- Validate all members before registering
+	validateServiceDefinition(name, definition)
 
 	ensureListeners()
 
@@ -311,38 +360,7 @@ function Registry.registerService(name: string, definition: { [string]: any }): 
 		print(string.format('[KirNet] Registered service "%s" with %d methods', name, methodCount))
 	end
 
-	-- Replicate to all connected clients
 	replicateRoutingTable()
-
-	-- Also replicate to future connecting players
-	-- (handled via PlayerAdded below)
-
-	return definition
-end
-
-function Registry.registerController(name: string, definition: { [string]: any }): { [string]: any }
-	if IS_SERVER then
-		warn(
-			string.format(
-				'[KirNet] WARNING: RegisterController("%s") called on server — skipping. Did you mean RegisterService?',
-				name
-			)
-		)
-		return definition
-	end
-
-	ensureListeners()
-
-	local methods: { [string]: any } = {}
-
-	for methodName, impl in definition do
-		local routeId = Router.register(name, methodName)
-		impl:_init(name, methodName, routeId)
-		_routeHandlers[routeId] = impl
-		methods[methodName] = impl
-	end
-
-	_controllers[name] = methods
 
 	return definition
 end
@@ -357,7 +375,6 @@ function Registry.getService(name: string, timeout: number?): { [string]: any }
 			return service
 		end
 
-		-- Wait for registration on server side too
 		local elapsed = 0
 		local dt = 0
 		while elapsed < timeoutSec do
@@ -371,7 +388,7 @@ function Registry.getService(name: string, timeout: number?): { [string]: any }
 
 		error(
 			string.format(
-				'[KirNet] ERROR: GetService("%s") timed out after %d seconds. Is the service registered on the server?',
+				'[KirNet] GetService("%s") timed out after %d seconds. Is the service registered on the server?',
 				name,
 				timeoutSec
 			)
@@ -381,7 +398,6 @@ function Registry.getService(name: string, timeout: number?): { [string]: any }
 	-- Client-side: wait for routing table delivery
 	ensureListeners()
 
-	-- Check if we already have routes for this service
 	local function checkReady(): { [string]: any }?
 		local routeTable = Router.getTable()
 		local methods: { [string]: any } = {}
@@ -390,17 +406,22 @@ function Registry.getService(name: string, timeout: number?): { [string]: any }
 			local svcName, methodName = Router.parse(key)
 			if svcName == name then
 				found = true
-				-- Create client-side proxy signal/function
 				local handler = _routeHandlers[routeId]
 				if handler then
 					methods[methodName] = handler
 				else
-					-- Create a lightweight client proxy matching the server-side type
+					-- Create client-side proxy based on member kind from routing table
+					local memberKind = _routeTypes[routeId]
 					local proxy
-					if _routeTypes[routeId] == "function" then
-						proxy = KirFunction.new()
+					if memberKind == "serverFunction" then
+						proxy = KirFunction.new(nil)
+					elseif memberKind == "clientSignal" then
+						proxy = Signal.new("client")
+					elseif memberKind == "signal" then
+						proxy = Signal.new("signal")
 					else
-						proxy = Signal.new()
+						-- Default: serverSignal (server-to-client)
+						proxy = Signal.new("server")
 					end
 					proxy:_init(svcName, methodName, routeId)
 					_routeHandlers[routeId] = proxy
@@ -419,14 +440,12 @@ function Registry.getService(name: string, timeout: number?): { [string]: any }
 		return result
 	end
 
-	-- Wait for the service routing info to arrive
 	local thread = coroutine.running()
 	if not _waitingForService[name] then
 		_waitingForService[name] = {}
 	end
 	table.insert(_waitingForService[name], thread)
 
-	-- Set up timeout
 	local timedOut = false
 	task.delay(timeoutSec, function()
 		local waiting = _waitingForService[name]
@@ -435,7 +454,7 @@ function Registry.getService(name: string, timeout: number?): { [string]: any }
 			if idx then
 				table.remove(waiting, idx)
 				timedOut = true
-				task.spawn(thread) -- resume the yielded coroutine so it can check timedOut
+				task.spawn(thread)
 			end
 		end
 	end)
@@ -445,24 +464,19 @@ function Registry.getService(name: string, timeout: number?): { [string]: any }
 	if timedOut then
 		error(
 			string.format(
-				'[KirNet] ERROR: GetService("%s") timed out after %d seconds. Is the service registered on the server?',
+				'[KirNet] GetService("%s") timed out after %d seconds. Is the service registered on the server?',
 				name,
 				timeoutSec
 			)
 		)
 	end
 
-	-- Service should now be available in routes
 	result = checkReady()
 	if result then
 		return result
 	end
 
-	error(string.format('[KirNet] ERROR: GetService("%s") failed to resolve after routing table arrived.', name))
-end
-
-function Registry.getController(name: string): { [string]: any }?
-	return _controllers[name]
+	error(string.format('[KirNet] GetService("%s") failed to resolve after routing table arrived.', name))
 end
 
 --- Get a service that was already registered on this peer (no yield).

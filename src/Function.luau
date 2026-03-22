@@ -1,13 +1,19 @@
---!strict
+﻿--!strict
 
 --[[
-	Function.luau — Function (request/response) implementation for KirNet.
+	Function.luau - ServerFunction (request/response) implementation for KirNet.
 
 	Defined server-side with a handler. Called client-side, yields and returns
 	the server's response directly. Uses the shared RemoteFunction for invocation.
+
+	Strict directional enforcement:
+	  - Call() can only be used on the client
+	  - Handler is provided at creation time on the server
+	  - Rate limiting is enforced on the server for incoming calls
 ]]
 
 local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
 
 local Types = require(script.Parent.Types)
 local Codec = require(script.Parent.Codec)
@@ -31,6 +37,60 @@ end
 
 function KirFunction.setDebug(enabled: boolean)
 	_debugEnabled = enabled
+end
+
+-- Rate limiting state: [routeId] -> [playerId] -> { count, lastReset }
+local _rateLimits: { [number]: { [number]: { count: number, lastReset: number } } } = {}
+
+if IS_SERVER then
+	Players.PlayerRemoving:Connect(function(player)
+		local userId = player.UserId
+		for _, playerLimits in _rateLimits do
+			playerLimits[userId] = nil
+		end
+	end)
+end
+
+local function checkRateLimit(
+	routeId: number,
+	player: Player,
+	limit: number,
+	serviceName: string,
+	methodName: string
+): boolean
+	if not _rateLimits[routeId] then
+		_rateLimits[routeId] = {}
+	end
+	local playerLimits = _rateLimits[routeId]
+	local userId = player.UserId
+
+	local now = os.clock()
+	local entry = playerLimits[userId]
+	if not entry then
+		entry = { count = 0, lastReset = now }
+		playerLimits[userId] = entry
+	end
+
+	if now - entry.lastReset >= 1 then
+		entry.count = 0
+		entry.lastReset = now
+	end
+
+	entry.count += 1
+	if entry.count > limit then
+		warn(
+			string.format(
+				"[KirNet] WARN: %s.%s rate limited for %s (%d/%d per sec)",
+				serviceName,
+				methodName,
+				player.Name,
+				entry.count,
+				limit
+			)
+		)
+		return false
+	end
+	return true
 end
 
 function KirFunction.new(
@@ -103,22 +163,27 @@ local function decodePacket(pkt: buffer): (number, buffer)
 		local ok, decompressed = pcall(Compression.decompress, payload)
 		if ok then
 			payload = decompressed
+		else
+			warn(string.format("[KirNet] WARN: Function decompression failed: %s", tostring(decompressed)))
 		end
 	end
 
 	return buffer.readu16(pkt, 0), payload
 end
 
---- Client calls the function → yields and returns the server's response directly.
+--- Client calls the function -> yields and returns the server's response directly.
+--- ServerFunction only, client only.
 function KirFunction.Call(self: any, ...: any): ...any
 	if IS_SERVER then
-		warn("[KirNet] WARNING: Function:Call() should only be used on the client.")
-		return nil
+		error(string.format(
+			"[KirNet] %s.%s:Call() failed - Call() can only be used on the client.",
+			self._serviceName or "?", self._methodName or "?"
+		))
 	end
 
 	local remote = _remoteFunction
 	if not remote or not self._id then
-		error("[KirNet] Remote not ready")
+		error("[KirNet] Remote not ready. Is the service registered?")
 	end
 
 	local context: Types.MiddlewareContext = {
@@ -136,6 +201,10 @@ function KirFunction.Call(self: any, ...: any): ...any
 	local payload, flags = preparePayload(self, table.unpack(context.payload))
 	local pkt = buildPacket(routeId, flags, payload)
 
+	if _debugEnabled then
+		print(string.format("[KirNet] %s.%s:Call() -> server", self._serviceName or "?", self._methodName or "?"))
+	end
+
 	local result = remote:InvokeServer(pkt)
 
 	if typeof(result) == "buffer" then
@@ -146,10 +215,23 @@ function KirFunction.Call(self: any, ...: any): ...any
 	return result
 end
 
---- Internal: Handle an incoming function invoke on the server side
+--- Internal: Handle an incoming function invoke on the server side.
+--- Includes rate limiting enforcement.
 function KirFunction._handleInvoke(self: any, player: Player, pkt: buffer): buffer?
 	if not self._handler then
+		warn(string.format(
+			"[KirNet] %s.%s has no handler registered.",
+			self._serviceName or "?", self._methodName or "?"
+		))
 		return nil
+	end
+
+	-- Rate limiting for incoming client calls
+	local opts = self._options :: Types.SignalOptions
+	if opts.rateLimit and self._id then
+		if not checkRateLimit(self._id, player, opts.rateLimit, self._serviceName or "", self._methodName or "") then
+			return nil
+		end
 	end
 
 	local _, payload = decodePacket(pkt)
@@ -164,6 +246,10 @@ function KirFunction._handleInvoke(self: any, player: Player, pkt: buffer): buff
 	}
 	if not Middleware.execute(context) then
 		return nil
+	end
+
+	if _debugEnabled then
+		print(string.format("[KirNet] %s.%s:_handleInvoke() from %s", self._serviceName or "?", self._methodName or "?", player.Name))
 	end
 
 	local results = { self._handler(player, table.unpack(context.payload)) }

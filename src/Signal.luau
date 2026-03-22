@@ -1,10 +1,14 @@
---!strict
+﻿--!strict
 
 --[[
-	Signal.luau — Signal implementation for KirNet.
+	Signal.luau - Signal implementation for KirNet.
 
-	Handles both server→client and client→server signal communication.
-	Signals are fire-and-forget; use Function for request/response.
+	Two signal kinds:
+	  ServerSignal ("server") - server fires events to clients, clients listen
+	  ClientSignal ("client") - client fires events to server, server listens
+
+	Strict directional enforcement: methods error immediately if called
+	from the wrong side or with the wrong signal kind.
 ]]
 
 local Players = game:GetService("Players")
@@ -39,7 +43,7 @@ function Signal.setDebug(enabled: boolean)
 	_debugEnabled = enabled
 end
 
--- Rate limiting state: [routeId] → [playerId] → { count, lastReset }
+-- Rate limiting state: [routeId] -> [playerId] -> { count, lastReset }
 local _rateLimits: { [number]: { [number]: { count: number, lastReset: number } } } = {}
 
 if IS_SERVER then
@@ -96,7 +100,7 @@ end
 
 local function buildPacket(routeId: number, flags: number, payload: buffer): buffer
 	local payloadLen = buffer.len(payload)
-	-- [remoteId: u16][flags: u8][payloadLength: u32][payload: bytes]
+	-- [routeId: u16][flags: u8][payloadLength: u32][payload: bytes]
 	local pkt = buffer.create(2 + 1 + 4 + payloadLen)
 	buffer.writeu16(pkt, 0, routeId)
 	buffer.writeu8(pkt, 2, flags)
@@ -125,9 +129,10 @@ local function buildBatchPacket(packets: { buffer }): buffer
 	return batch
 end
 
-function Signal.new(options: Types.SignalOptions?): Types.SignalImpl
+function Signal.new(kind: "server" | "client", options: Types.SignalOptions?): Types.SignalImpl
 	local self: Types.SignalImpl = {
 		_options = options or {} :: Types.SignalOptions,
+		_kind = kind,
 		_id = nil,
 		_serviceName = nil,
 		_methodName = nil,
@@ -145,7 +150,7 @@ function Signal._init(self: any, serviceName: string, methodName: string, id: nu
 	self._id = id
 
 	local opts = self._options :: Types.SignalOptions
-	if opts.batched and IS_SERVER then
+	if opts.batched and IS_SERVER and (self._kind == "server" or self._kind == "signal") then
 		Batcher.register(id, function(entries: { Batcher.BatchEntry })
 			Signal._flushBatch(self, entries)
 		end)
@@ -159,7 +164,6 @@ function Signal._flushBatch(self: any, entries: { Batcher.BatchEntry })
 	end
 
 	-- Group entries by target pattern to send correct packets to correct recipients
-	-- Group key: "all", "except:<UserId>", "players:<sorted UserId list>"
 	local groups: { [string]: { entries: { Batcher.BatchEntry }, sample: Batcher.BatchEntry } } = {}
 
 	for _, entry in entries do
@@ -188,7 +192,8 @@ function Signal._flushBatch(self: any, entries: { Batcher.BatchEntry })
 	for _, group in groups do
 		local allPackets: { buffer } = {}
 		for _, entry in group.entries do
-			table.insert(allPackets, buildPacket(entry.id, FLAG_BATCHED, entry.payload))
+			-- Preserve original flags (compression, lossy) and add batched flag
+			table.insert(allPackets, buildPacket(entry.id, bit32.bor(entry.flags, FLAG_BATCHED), entry.payload))
 		end
 
 		if #allPackets == 0 then
@@ -257,11 +262,104 @@ local function preparePayload(self: any, ...: any): (buffer, number)
 	return payload, flags
 end
 
---- Server → single player
-function Signal.Fire(self: any, player: Player, ...: any)
-	if not IS_SERVER then
-		return
+-- Strict direction helpers
+local function assertServerSignalOnServer(self: any, method: string)
+	if self._kind ~= "server" and self._kind ~= "signal" then
+		error(
+			string.format(
+				"[KirNet] %s.%s:%s() failed — %s is only available on ServerSignal or Signal, not ClientSignal.",
+				self._serviceName or "?",
+				self._methodName or "?",
+				method,
+				method
+			)
+		)
 	end
+	if not IS_SERVER then
+		error(
+			string.format(
+				"[KirNet] %s.%s:%s() failed — Fire methods can only be called on the server.",
+				self._serviceName or "?",
+				self._methodName or "?",
+				method
+			)
+		)
+	end
+end
+
+local function assertClientSignalOnClient(self: any, method: string)
+	if self._kind ~= "client" and self._kind ~= "signal" then
+		error(
+			string.format(
+				"[KirNet] %s.%s:%s() failed — FireServer is only available on ClientSignal or Signal, not ServerSignal.",
+				self._serviceName or "?",
+				self._methodName or "?",
+				method
+			)
+		)
+	end
+	if IS_SERVER then
+		error(
+			string.format(
+				"[KirNet] %s.%s:%s() failed — FireServer can only be called on the client.",
+				self._serviceName or "?",
+				self._methodName or "?",
+				method
+			)
+		)
+	end
+end
+
+local function assertServerSignalOnClient(self: any, method: string)
+	if self._kind ~= "server" and self._kind ~= "signal" then
+		error(
+			string.format(
+				"[KirNet] %s.%s:%s() failed — %s is only available on ServerSignal or Signal (server-to-client), not ClientSignal.",
+				self._serviceName or "?",
+				self._methodName or "?",
+				method,
+				method
+			)
+		)
+	end
+	if IS_SERVER then
+		error(
+			string.format(
+				"[KirNet] %s.%s:%s() failed — Client listener methods can only be used on the client.",
+				self._serviceName or "?",
+				self._methodName or "?",
+				method
+			)
+		)
+	end
+end
+
+local function assertClientSignalOnServer(self: any, method: string)
+	if self._kind ~= "client" and self._kind ~= "signal" then
+		error(
+			string.format(
+				"[KirNet] %s.%s:%s() failed — OnServerEvent is only available on ClientSignal or Signal, not ServerSignal.",
+				self._serviceName or "?",
+				self._methodName or "?",
+				method
+			)
+		)
+	end
+	if not IS_SERVER then
+		error(
+			string.format(
+				"[KirNet] %s.%s:%s() failed — OnServerEvent can only be used on the server.",
+				self._serviceName or "?",
+				self._methodName or "?",
+				method
+			)
+		)
+	end
+end
+
+--- Server -> single player (ServerSignal only, server only)
+function Signal.Fire(self: any, player: Player, ...: any)
+	assertServerSignalOnServer(self, "Fire")
 	local remote = _remoteEvent
 	if not remote or not self._id then
 		return
@@ -284,6 +382,7 @@ function Signal.Fire(self: any, player: Player, ...: any)
 	if opts.batched and Batcher.hasBatch(self._id) then
 		Batcher.enqueue(self._id, {
 			id = self._id,
+			flags = flags,
 			payload = payload,
 			targets = { player },
 			excludePlayer = nil,
@@ -293,20 +392,16 @@ function Signal.Fire(self: any, player: Player, ...: any)
 		local pkt = buildPacket(self._id, flags, payload)
 
 		if _debugEnabled then
-			print(
-				string.format("[KirNet] %s.%s → %s", self._serviceName or "?", self._methodName or "?", player.Name)
-			)
+			print(string.format("[KirNet] %s.%s -> %s", self._serviceName or "?", self._methodName or "?", player.Name))
 		end
 
 		remote:FireClient(player, pkt)
 	end
 end
 
---- Server → all players
+--- Server -> all players (ServerSignal only, server only)
 function Signal.FireAll(self: any, ...: any)
-	if not IS_SERVER then
-		return
-	end
+	assertServerSignalOnServer(self, "FireAll")
 	local remote = _remoteEvent
 	if not remote or not self._id then
 		return
@@ -329,6 +424,7 @@ function Signal.FireAll(self: any, ...: any)
 	if opts.batched and Batcher.hasBatch(self._id) then
 		Batcher.enqueue(self._id, {
 			id = self._id,
+			flags = flags,
 			payload = payload,
 			targets = nil,
 			excludePlayer = nil,
@@ -340,11 +436,9 @@ function Signal.FireAll(self: any, ...: any)
 	end
 end
 
---- Server → all except one player
+--- Server -> all except one player (ServerSignal only, server only)
 function Signal.FireExcept(self: any, player: Player, ...: any)
-	if not IS_SERVER then
-		return
-	end
+	assertServerSignalOnServer(self, "FireExcept")
 	local remote = _remoteEvent
 	if not remote or not self._id then
 		return
@@ -367,6 +461,7 @@ function Signal.FireExcept(self: any, player: Player, ...: any)
 	if opts.batched and Batcher.hasBatch(self._id) then
 		Batcher.enqueue(self._id, {
 			id = self._id,
+			flags = flags,
 			payload = payload,
 			targets = nil,
 			excludePlayer = player,
@@ -382,11 +477,9 @@ function Signal.FireExcept(self: any, player: Player, ...: any)
 	end
 end
 
---- Server → list of players
+--- Server -> list of players (ServerSignal only, server only)
 function Signal.FireList(self: any, players: { Player }, ...: any)
-	if not IS_SERVER then
-		return
-	end
+	assertServerSignalOnServer(self, "FireList")
 	local remote = _remoteEvent
 	if not remote or not self._id then
 		return
@@ -409,6 +502,7 @@ function Signal.FireList(self: any, players: { Player }, ...: any)
 	if opts.batched and Batcher.hasBatch(self._id) then
 		Batcher.enqueue(self._id, {
 			id = self._id,
+			flags = flags,
 			payload = payload,
 			targets = players,
 			excludePlayer = nil,
@@ -422,11 +516,9 @@ function Signal.FireList(self: any, players: { Player }, ...: any)
 	end
 end
 
---- Client → Server
+--- Client -> Server (ClientSignal only, client only)
 function Signal.FireServer(self: any, ...: any)
-	if IS_SERVER then
-		return
-	end
+	assertClientSignalOnClient(self, "FireServer")
 	local remote = _remoteEvent
 	if not remote or not self._id then
 		return
@@ -448,23 +540,27 @@ function Signal.FireServer(self: any, ...: any)
 	remote:FireServer(pkt)
 end
 
---- Connect a callback (client-side s2c, or server-side c2s via OnServerEvent)
+--- Connect a callback to listen for server broadcasts (ServerSignal, client only)
 function Signal.Connect(self: any, callback: (...any) -> ())
+	assertServerSignalOnClient(self, "Connect")
 	table.insert(self._callbacks, callback)
 end
 
---- Listen for client→server events (server-side convenience)
+--- Listen for client-to-server events (ClientSignal, server only)
 function Signal.OnServerEvent(self: any, callback: (player: Player, ...any) -> ())
+	assertClientSignalOnServer(self, "OnServerEvent")
 	table.insert(self._callbacks, callback)
 end
 
---- Connect a callback that fires once then auto-disconnects
+--- Connect a callback that fires once then auto-disconnects (ServerSignal, client only)
 function Signal.Once(self: any, callback: (...any) -> ())
+	assertServerSignalOnClient(self, "Once")
 	table.insert(self._onceCallbacks, callback)
 end
 
---- Yield until the signal fires or timeout expires
+--- Yield until the signal fires or timeout expires (ServerSignal, client only)
 function Signal.Wait(self: any, timeout: number?): ...any
+	assertServerSignalOnClient(self, "Wait")
 	local thread = coroutine.running()
 	local timedOut = false
 	table.insert(self._waitingThreads, thread)
@@ -475,7 +571,7 @@ function Signal.Wait(self: any, timeout: number?): ...any
 			if idx then
 				table.remove(self._waitingThreads, idx)
 				timedOut = true
-				task.spawn(thread) -- resume so coroutine.yield() returns
+				task.spawn(thread)
 			end
 		end)
 	end
@@ -489,11 +585,11 @@ function Signal.Wait(self: any, timeout: number?): ...any
 	return table.unpack(results)
 end
 
---- Disconnect all callbacks
+--- Disconnect all callbacks (ServerSignal, client only)
 function Signal.Disconnect(self: any)
+	assertServerSignalOnClient(self, "Disconnect")
 	table.clear(self._callbacks)
 	table.clear(self._onceCallbacks)
-	-- Resume and clear waiting threads
 	for _, thread in self._waitingThreads do
 		task.defer(thread)
 	end
@@ -506,14 +602,12 @@ function Signal._dispatch(self: any, ...: any)
 		task.spawn(cb, ...)
 	end
 
-	-- Once callbacks fire and then get cleared
 	local onceCbs = table.clone(self._onceCallbacks)
 	table.clear(self._onceCallbacks)
 	for _, cb in onceCbs do
 		task.spawn(cb, ...)
 	end
 
-	-- Resume waiting threads
 	local waiting = table.clone(self._waitingThreads)
 	table.clear(self._waitingThreads)
 	for _, thread in waiting do
@@ -530,7 +624,7 @@ function Signal._checkRate(self: any, player: Player): boolean
 	return checkRateLimit(self._id, player, opts.rateLimit, self._serviceName or "", self._methodName or "")
 end
 
---- Parse packet and decode payload
+--- Parse packet and decode payload (decompresses if FLAG_COMPRESSED is set)
 function Signal.parsePacket(pkt: buffer): (number, number, buffer)
 	local routeId = buffer.readu16(pkt, 0)
 	local flags = buffer.readu8(pkt, 2)
@@ -540,11 +634,13 @@ function Signal.parsePacket(pkt: buffer): (number, number, buffer)
 		buffer.copy(payload, 0, pkt, 7, payloadLen)
 	end
 
-	-- Decompress if needed
+	-- Decompress if needed (buffer in, buffer out)
 	if bit32.band(flags, FLAG_COMPRESSED) ~= 0 then
 		local ok, decompressed = pcall(Compression.decompress, payload)
 		if ok then
 			payload = decompressed
+		else
+			warn(string.format("[KirNet] WARN: Decompression failed for route %d: %s", routeId, tostring(decompressed)))
 		end
 	end
 
@@ -563,9 +659,17 @@ function Signal.parseBatch(pkt: buffer): { buffer }
 	local cursor = 4
 
 	for _ = 1, count do
+		if cursor + 7 > buffer.len(pkt) then
+			warn("[KirNet] WARN: Batch packet truncated, stopping parse.")
+			break
+		end
 		-- Each sub-packet: [routeId: u16][flags: u8][payloadLength: u32][payload]
 		local payloadLen = buffer.readu32(pkt, cursor + 3)
 		local pktLen = 7 + payloadLen
+		if cursor + pktLen > buffer.len(pkt) then
+			warn("[KirNet] WARN: Batch sub-packet exceeds buffer, stopping parse.")
+			break
+		end
 		local subPkt = buffer.create(pktLen)
 		buffer.copy(subPkt, 0, pkt, cursor, pktLen)
 		table.insert(packets, subPkt)

@@ -241,9 +241,13 @@ function writeValue(buf: buffer, cursor: number, value: any, precision: number, 
 		return buf, cursor
 	end
 
-	-- Fallback: encode as string representation
-	buf, cursor = writeTag(buf, cursor, TAG_STRING)
-	return writeString(buf, cursor, tostring(value))
+	error(
+		string.format(
+			"[KirNet] Codec error: unsupported type '%s' (value: %s). Supported types: nil, boolean, number, string, Vector3, Vector2, CFrame, Color3, UDim2, table.",
+			tostring(typeof(value)),
+			tostring(value)
+		)
+	)
 end
 
 function readValue(buf: buffer, cursor: number): (any, number)
