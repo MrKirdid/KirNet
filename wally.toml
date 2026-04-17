@@ -1,10 +1,16 @@
 [package]
 name = "mrkirdid/kirnet"
-version = "1.9.2"
+version = "3.0.0"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 exclude = [
+	"Example",
+	"Example/**",
+	"kirnet-type-gen",
 	"kirnet-type-gen/**",
+	"src/ReplicatedStorage",
+	"src/ReplicatedStorage/**",
+	"src/_typesdump.luau",
 	"aftman.toml",
 	"default.project.json",
 	"selene.toml",

@@ -2,7 +2,15 @@
 	"name": "kirnet-type-gen",
 	"displayName": "KirNet Type Generator",
 	"description": "Generates typed Luau wrappers for KirNet services and provides GetService autocomplete.",
-	"version": "0.1.0",
+	"homepage": "https://github.com/MrKirdid/KirNet#readme",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/MrKirdid/KirNet.git"
+	},
+	"bugs": {
+		"url": "https://github.com/MrKirdid/KirNet/issues"
+	},
+	"version": "0.2.0",
 	"publisher": "kirnet",
 	"engines": {
 		"vscode": "^1.85.0"
@@ -23,6 +31,10 @@
 			{
 				"command": "kirnet.showOutput",
 				"title": "KirNet: Show Output"
+			},
+			{
+				"command": "kirnet.openGithubReadme",
+				"title": "KirNet: Open GitHub README"
 			},
 			{
 				"command": "kirnet.openTypesFile",
@@ -47,6 +59,18 @@
 			{
 				"command": "kirnet.createService",
 				"title": "KirNet: Create New Service"
+			},
+			{
+				"command": "kirnet.init",
+				"title": "KirNet: Init"
+			},
+			{
+				"command": "kirnet.enable",
+				"title": "KirNet: Enable"
+			},
+			{
+				"command": "kirnet.disable",
+				"title": "KirNet: Disable"
 			}
 		]
 	},

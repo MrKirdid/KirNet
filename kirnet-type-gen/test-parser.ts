@@ -238,6 +238,32 @@ Net.RegisterService("CustomVar", {
 			},
 		],
 	},
+	// ─── LEGACY COLON-STYLE REGISTER SERVICE ──────────────────────────────────
+	{
+		name: "legacy colon-style RegisterService",
+		input: `
+local Kirnet = require(game.ReplicatedStorage.kirnet)
+local SammyService = {
+	Name = "SammyService",
+}
+
+SammyService.Client = Kirnet:RegisterService("SammyService", {
+	SpawnSammy = Kirnet.CreateSignal(),
+	ChangeNode = Kirnet.CreateSignal(),
+	DamagePlayer = Kirnet.CreateSignal(),
+})
+`,
+		expectedServices: [
+			{
+				name: "SammyService",
+				fields: [
+					{ name: "SpawnSammy", type: "Signal<any>" },
+					{ name: "ChangeNode", type: "Signal<any>" },
+					{ name: "DamagePlayer", type: "Signal<any>" },
+				],
+			},
+		],
+	},
 	// ─── SIGNAL: empty parens, no options ─────────────────────────────────────
 	{
 		name: "signal with empty options (nil arg)",
@@ -254,9 +280,71 @@ KirNet.RegisterService("SvcEmpty", {
 			},
 		],
 	},
-	// ─── New API: CreateServerSignal / CreateClientSignal / CreateServerFunction ──
+	// ─── Direction inference for CreateSignal(...) ────────────────────────────
 	{
-		name: "new API: CreateServerSignal, CreateClientSignal, CreateServerFunction",
+		name: "CreateSignal infers server direction from options",
+		input: `
+local KirNet = require(game.ReplicatedStorage.KirNet)
+KirNet.RegisterService("DirectedServerService", {
+	OnData = KirNet.CreateSignal({ direction = "server" }) :: KirNet.Signal<string>,
+})
+`,
+		expectedServices: [
+			{
+				name: "DirectedServerService",
+				fields: [{ name: "OnData", type: "ServerSignal<string>" }],
+			},
+		],
+	},
+	{
+		name: "CreateSignal infers client direction without cast",
+		input: `
+local KirNet = require(game.ReplicatedStorage.KirNet)
+KirNet.RegisterService("DirectedClientService", {
+	OnInput = KirNet.CreateSignal({ direction = "client" }),
+})
+`,
+		expectedServices: [
+			{
+				name: "DirectedClientService",
+				fields: [{ name: "OnInput", type: "ClientSignal<any>" }],
+			},
+		],
+	},
+	// ─── Variables ───────────────────────────────────────────────────────────
+	{
+		name: "typed variable",
+		input: `
+local KirNet = require(game.ReplicatedStorage.KirNet)
+KirNet.RegisterService("VarService", {
+	Enabled = KirNet.CreateVariable(true) :: KirNet.Variable<boolean>,
+})
+`,
+		expectedServices: [
+			{
+				name: "VarService",
+				fields: [{ name: "Enabled", type: "Variable<boolean>" }],
+			},
+		],
+	},
+	{
+		name: "untyped variable infers literal type",
+		input: `
+local KirNet = require(game.ReplicatedStorage.KirNet)
+KirNet.RegisterService("VarInferService", {
+	PlayerStamina = KirNet.CreateVariable(20),
+})
+`,
+		expectedServices: [
+			{
+				name: "VarInferService",
+				fields: [{ name: "PlayerStamina", type: "Variable<number>" }],
+			},
+		],
+	},
+	// ─── Legacy constructors still supported ─────────────────────────────────
+	{
+		name: "legacy constructors: CreateServerSignal, CreateClientSignal, CreateServerFunction",
 		input: `
 local KirNet = require(game.ReplicatedStorage.KirNet)
 KirNet.RegisterService("NewApiService", {

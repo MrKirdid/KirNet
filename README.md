@@ -1,22 +1,24 @@
 ﻿# KirNet
 
-KirNet is a focused, services-only networking library for Roblox. It lets the server expose typed signals and functions to clients through explicitly directional service definitions, without pulling in a larger framework or lifecycle model.
+KirNet is a services-first networking library for Roblox. Register services on the server, fetch them with `GetService()` on the client, and get typed, direction-safe networking with minimal API surface.
 
-## Key Properties
+## Why KirNet
 
-- **Services only** - no controllers, no separate client-side registration
-- **Strict directionality** - every member has explicit send/receive rules
-- **Runtime-enforced** - invalid side usage errors immediately with clear messages
-- **Buffer-based transport** - serialization, compression, and packet assembly stay buffer-based end-to-end
-- **Minimal surface** - small API, strong defaults, hard to misuse
+- Services only. No framework lifecycle, controller system, or startup ceremony.
+- Three building blocks: `CreateSignal`, `CreateFunction`, `CreateVariable`.
+- Runtime guardrails. Wrong-side and wrong-method calls error immediately.
+- Instance passthrough. Send Instances, userdata, or any unsupported type alongside compressed data — no errors, no workarounds.
+- Efficient transport. Buffers, optional batching, compression, lossy numeric payloads, and rate limiting are built in.
+- Replicated variables. `CreateVariable(value)` auto-syncs server state to clients.
+- Tooling. The companion `kirnet-type-gen` VS Code extension generates typed `GetService()` wrappers and string completions.
 
-## Install with Wally
+## Install
 
-Add KirNet to your `wally.toml` dependencies:
+Add KirNet to your `wally.toml`:
 
 ```toml
 [dependencies]
-KirNet = "mrkirdid/kirnet@2.0.0"
+KirNet = "mrkirdid/kirnet@3.0.0"
 ```
 
 Then install packages:
@@ -25,187 +27,209 @@ Then install packages:
 wally install
 ```
 
+Your require path depends on your package alias and Rojo mapping. In a typical shared package setup:
+
+```luau
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local KirNet = require(ReplicatedStorage.Packages.KirNet)
+```
+
 ## Quick Start
 
 ### Server
 
 ```luau
+--!strict
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local KirNet = require(ReplicatedStorage.Packages.KirNet)
 
 local ChatService = KirNet.RegisterService("ChatService", {
-	-- Server fires, client listens
-	MessageSent = KirNet.CreateServerSignal() :: KirNet.ServerSignal<string>,
+	-- Server → client broadcast
+	MessageSent = KirNet.CreateSignal({ direction = "server" }) :: KirNet.ServerSignal<string>,
 
-	-- Client fires, server listens
-	SendMessage = KirNet.CreateClientSignal() :: KirNet.ClientSignal<string>,
+	-- Client → server input
+	SendMessage = KirNet.CreateSignal({ direction = "client" }) :: KirNet.ClientSignal<string>,
 
-	-- Client calls, server handles
-	GetHistory = KirNet.CreateServerFunction(function(player: Player, channel: string): { string }
-		return { "Welcome to " .. channel }
+	-- Client calls, server responds
+	GetHistory = KirNet.CreateFunction(function(player: Player, channel: string): { string }
+		return { "Welcome to " .. channel, "Have fun." }
 	end),
+
+	-- Replicated variable (auto-syncs to clients)
+	Enabled = KirNet.CreateVariable(true),
 })
 
--- Server broadcasts to all clients
-ChatService.MessageSent:FireAll("Server ready")
-
--- Server listens for client events
 ChatService.SendMessage:OnServerEvent(function(player, text)
-	print(player.Name .. ": " .. text)
 	ChatService.MessageSent:FireAll(player.Name .. ": " .. text)
 end)
+
+-- Variables can be changed anytime — clients update automatically
+ChatService.Enabled:Set(false)
+
+return ChatService
 ```
 
 ### Client
 
 ```luau
+--!strict
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local KirNet = require(ReplicatedStorage.Packages.KirNet)
 
 local ChatService = KirNet.GetService("ChatService")
 
--- Client listens to server broadcasts
 ChatService.MessageSent:Connect(function(message)
 	print(message)
 end)
 
--- Client fires event to server
 ChatService.SendMessage:FireServer("hello from the client")
 
--- Client calls function on server
 local history = ChatService.GetHistory:Call("general")
-print(history)
+print(history[1])
+
+-- Read replicated variable
+print(ChatService.Enabled:Get())
+
+-- React to variable changes
+ChatService.Enabled:OnChanged(function(newValue, oldValue)
+	print("Chat enabled:", newValue)
+end)
 ```
 
-## Member Kinds
-
-| Kind | Creator | Server Can | Client Can |
-|------|---------|------------|------------|
-| **ServerSignal** | `CreateServerSignal()` | Fire, FireAll, FireExcept, FireList | Connect, Once, Wait, Disconnect |
-| **ClientSignal** | `CreateClientSignal()` | OnServerEvent | FireServer |
-| **ServerFunction** | `CreateServerFunction(handler)` | (provides handler) | Call |
-
-Calling a method from the wrong side or wrong member kind errors immediately:
-
-```
-[KirNet] ChatService.MessageSent:FireServer() failed - FireServer is only available on ClientSignal, not ServerSignal.
-```
-
-## API Surface
+`GetService()` yields until the service is available. Pass a timeout if you want it to fail early:
 
 ```luau
--- Member constructors (use inside service definitions)
-KirNet.CreateServerSignal(options?)          -- server-to-client event
-KirNet.CreateClientSignal(options?)          -- client-to-server event
-KirNet.CreateServerFunction(handler, options?)  -- client-to-server RPC
+local ChatService = KirNet.GetService("ChatService", 5)
+```
 
--- Service registration and retrieval
-KirNet.RegisterService(name, definition)     -- server only
-KirNet.GetService(name, timeout?)            -- yields on client
+## API
 
--- Global middleware
+```luau
+-- Signals
+KirNet.CreateSignal(options?)                  -- bidirectional by default
+KirNet.CreateSignal({ direction = "server" })  -- server → client only
+KirNet.CreateSignal({ direction = "client" })  -- client → server only
+
+-- Functions
+KirNet.CreateFunction(handler?, options?)
+
+-- Variables
+KirNet.CreateVariable(initialValue)
+
+-- Service management
+KirNet.RegisterService(name, definition)   -- server only
+KirNet.GetService(name, timeout?)          -- client or server
+
+-- Utilities
 KirNet.UseMiddleware(fn)
-
--- Debug logging
 KirNet.SetDebug(enabled)
 ```
 
-Exported types: `ServerSignal<T...>`, `ClientSignal<T...>`, `ServerFunction<TReturn>`, `SignalOptions`, `MiddlewareContext`, `MiddlewareFn`.
+### Signal Direction
 
-## Signal Options
+| Direction | Server API | Client API | Use it for |
+| --- | --- | --- | --- |
+| `nil` (bidirectional) | `Fire`, `FireAll`, `FireExcept`, `FireList`, `OnServerEvent` | `FireServer`, `Connect`, `Once`, `Wait`, `Disconnect` | Rare bidirectional channels |
+| `"server"` | `Fire`, `FireAll`, `FireExcept`, `FireList` | `Connect`, `Once`, `Wait`, `Disconnect` | Broadcasts, state pushes |
+| `"client"` | `OnServerEvent` | `FireServer` | Input, actions, requests |
 
-All signal and function constructors accept an options table:
+### Variable API
+
+| Method | Side | Description |
+| --- | --- | --- |
+| `:Get()` | Both | Returns the current value |
+| `:Set(value)` | Server | Updates and replicates to all clients |
+| `:OnChanged(callback)` | Both | Fires `callback(newValue, oldValue)` on change |
+
+### Exported Types
+
+- `KirNet.ServerSignal<T...>`
+- `KirNet.ClientSignal<T...>`
+- `KirNet.Signal<T...>`
+- `KirNet.ServerFunction<TReturn>`
+- `KirNet.Variable<T>`
+- `KirNet.SignalOptions`
+- `KirNet.MiddlewareContext`
+- `KirNet.MiddlewareFn`
+
+## Options
+
+All signal and function constructors accept the same options table:
 
 ```luau
-KirNet.CreateServerSignal({
-	batched = true,               -- batch multiple fires per frame into one packet
-	lossy = true,                 -- use f32 instead of f64 for floats
-	precision = 2,                -- decimal places for lossy rounding
-	compressionThreshold = 64,    -- compress payloads >= this many bytes
-	rateLimit = 30,               -- max invocations per second per player (client-to-server)
+KirNet.CreateSignal({
+	direction = "client",
+	batched = false,
+	lossy = false,
+	precision = 2,
+	rateLimit = 15,
+	compressionThreshold = 64,
 })
 ```
 
-### Batching
+| Option | What it does |
+| --- | --- |
+| `direction` | `"server"`, `"client"`, or omit for bidirectional. |
+| `batched` | Groups multiple server-to-client fires in the same frame into one packet. |
+| `lossy` | Uses reduced-precision numeric encoding to cut bandwidth. |
+| `precision` | Decimal precision used when `lossy` is enabled. |
+| `compressionThreshold` | Compresses payloads above this byte size when compression saves space. |
+| `rateLimit` | Limits incoming client-to-server traffic per player per second. |
 
-When `batched = true`, all fires within one Heartbeat frame are collected and sent as a single packet. This reduces remote call overhead for high-frequency signals. Batching preserves per-packet compression flags.
+## Instance & Userdata Passthrough
 
-### Lossy Precision
-
-When `lossy = true`, floats are serialized as f32 instead of f64, and Vector3/CFrame components are rounded to the specified `precision`. Good for position updates where exact precision is unnecessary.
-
-### Compression
-
-Payloads at or above `compressionThreshold` bytes are compressed using a buffer-based LZ77 algorithm. Compressed data is only used if smaller than the original. The entire pipeline stays buffer-based:
-
-1. Codec encodes values to buffer
-2. Compression compresses buffer to smaller buffer (if beneficial)
-3. Packet assembly wraps payload buffer with routing header
-4. Transport sends buffer via RemoteEvent/RemoteFunction
-5. Decompression restores original buffer
-6. Codec decodes buffer back to values
-
-Compression helps for larger structured payloads. For small payloads (under 64 bytes), compression typically increases size and is skipped.
-
-### Rate Limiting
-
-When `rateLimit` is set, incoming calls from each client are limited to that many per second. Applies to both ClientSignal events and ServerFunction calls. Excess calls are dropped with a warning.
+KirNet automatically handles unsupported types like `Instance` or userdata. If a value can't be buffer-encoded, it's sent alongside the buffer as a passthrough value and correctly reassembled on the other side. No configuration needed.
 
 ```luau
--- Both signals and functions can be rate-limited
-EquipItem = KirNet.CreateClientSignal({ rateLimit = 10 }) :: KirNet.ClientSignal<string>,
-PurchaseItem = KirNet.CreateServerFunction(function(player, itemId)
-	return { success = true }
-end, { rateLimit = 5 }),
+-- This just works — the Part is sent as a passthrough, the string is buffer-encoded
+MySignal:FireAll("hit", workspace.Part, 42)
 ```
 
 ## Middleware
 
-Global middleware runs on every remote call, in registration order:
+Middleware runs on every remote call in registration order. Inspect payloads, mutate them, or abort by not invoking `next()`.
 
 ```luau
 KirNet.UseMiddleware(function(context, next)
 	print(context.direction, context.service, context.name)
-	next(context) -- must call next() to continue; omit to abort
+	next(context)
 end)
 ```
 
-The `context` contains: `name` (method), `service` (service name), `player` (sender, if c2s), `payload` (args table), `direction` ("c2s" or "s2c").
+`context` contains: `name`, `service`, `player`, `payload`, `direction` (`"c2s"` or `"s2c"`).
 
-## Serialization
+## VS Code Type Generator
 
-KirNet uses a compact binary codec that supports: `nil`, `boolean`, `number` (auto-selects smallest integer or float representation), `string`, `Vector3`, `Vector2`, `CFrame` (quaternion-compressed rotation), `Color3`, `UDim2`, and `table` (recursive).
+The `kirnet-type-gen` extension makes KirNet fully typed in your editor.
 
-Unsupported types (instances, userdata, etc.) error immediately:
+It can:
 
-```
-[KirNet] Codec error: unsupported type 'Instance' (value: Workspace). Supported types: nil, boolean, number, string, Vector3, Vector2, CFrame, Color3, UDim2, table.
-```
+- Generate a typed KirNet wrapper for `GetService("ServiceName")`
+- Autocomplete service names inside `GetService("...")`
+- Regenerate types on save and on startup
+- Initialize a `kirnet.toml` config with `KirNet: Init`
+- Enable/disable per project with `KirNet: Enable` / `KirNet: Disable`
+- Jump to service definitions, list services, scaffold new services
 
-## What KirNet Does Not Replace
+### Setup
 
-KirNet handles application-level networking: events, RPC, fan-out, selective sends, batching, compression, middleware, rate limiting, and structured serialization.
+1. Open a workspace that contains `default.project.json`.
+2. Install the extension from `kirnet-type-gen/`.
+3. Run `KirNet: Init` from the Command Palette to create a `kirnet.toml`.
+4. Save a service file — types regenerate automatically.
 
-KirNet does **not** replace:
-- Roblox physics replication and ownership
-- Character replication and movement
-- Built-in data store or memory store APIs
-- Instance replication (Workspace, ReplicatedStorage sync)
-- Terrain streaming or other engine-level systems
+## Example Project
 
-Use KirNet for your game's custom networking needs alongside the engine's built-in systems.
-
-## Type Generation
-
-This repository includes `kirnet-type-gen`, a VS Code extension that generates typed wrappers for KirNet services. See `kirnet-type-gen/README.md` for details.
+The `Example/` folder is a complete Rojo + Wally sample project.
 
 ## Repository Layout
 
-- `src/` contains the runtime package published through Wally.
-- `init.luau` re-exports the package entrypoint.
-- `default.project.json` maps the package into ReplicatedStorage for Rojo projects.
-- `kirnet-type-gen/` contains the companion VS Code extension.
+- `src/` — runtime package source
+- `init.luau` — package re-export entrypoint
+- `default.project.json` — Rojo mapping for the package
+- `kirnet-type-gen/` — VS Code extension
+- `Example/` — example Roblox project
 
 ## License
 
-KirNet is available under the MIT License. See `LICENSE`.
+KirNet is released under the MIT License. See `LICENSE`.

@@ -1,11 +1,12 @@
-﻿--!strict
+--!strict
 
 --[[
 	Signal.luau - Signal implementation for KirNet.
 
-	Two signal kinds:
+	Three signal kinds:
 	  ServerSignal ("server") - server fires events to clients, clients listen
 	  ClientSignal ("client") - client fires events to server, server listens
+	  Signal ("signal") - bidirectional signal with both APIs
 
 	Strict directional enforcement: methods error immediately if called
 	from the wrong side or with the wrong signal kind.
@@ -17,7 +18,6 @@ local RunService = game:GetService("RunService")
 local Types = require(script.Parent.Types)
 local Codec = require(script.Parent.Codec)
 local Compression = require(script.Parent.Compression)
-local Router = require(script.Parent.Router)
 local Middleware = require(script.Parent.Middleware)
 local Batcher = require(script.Parent.Batcher)
 
@@ -34,6 +34,15 @@ local FLAG_LOSSY: number = 0x04
 -- Module-level references set by Registry
 local _remoteEvent: RemoteEvent? = nil
 local _debugEnabled = false
+
+local function packArgs(...: any): { any }
+	return table.pack(...)
+end
+
+local function unpackArgs(args: { any }): ...any
+	local packed = args :: any
+	return table.unpack(packed, 1, packed.n or #packed)
+end
 
 function Signal.setRemoteEvent(remote: RemoteEvent)
 	_remoteEvent = remote
@@ -129,7 +138,7 @@ local function buildBatchPacket(packets: { buffer }): buffer
 	return batch
 end
 
-function Signal.new(kind: "server" | "client", options: Types.SignalOptions?): Types.SignalImpl
+function Signal.new(kind: "server" | "client" | "signal", options: Types.SignalOptions?): Types.SignalImpl
 	local self: Types.SignalImpl = {
 		_options = options or {} :: Types.SignalOptions,
 		_kind = kind,
@@ -157,20 +166,53 @@ function Signal._init(self: any, serviceName: string, methodName: string, id: nu
 	end
 end
 
-function Signal._flushBatch(self: any, entries: { Batcher.BatchEntry })
+function Signal._flushBatch(_self: any, entries: { Batcher.BatchEntry })
 	local remote = _remoteEvent
 	if not remote then
+		return
+	end
+
+	-- Separate entries with and without passthrough
+	local normalEntries: { Batcher.BatchEntry } = {}
+	local passthroughEntries: { Batcher.BatchEntry } = {}
+
+	for _, entry in entries do
+		if entry.passthrough and #entry.passthrough > 0 then
+			table.insert(passthroughEntries, entry)
+		else
+			table.insert(normalEntries, entry)
+		end
+	end
+
+	-- Send passthrough entries individually (can't batch with passthrough data)
+	for _, entry in passthroughEntries do
+		local pkt = buildPacket(entry.id, entry.flags, entry.payload)
+		if entry.excludePlayer then
+			for _, player in Players:GetPlayers() do
+				if player ~= entry.excludePlayer then
+					remote:FireClient(player, pkt, entry.passthrough)
+				end
+			end
+		elseif entry.targets then
+			for _, player in entry.targets do
+				remote:FireClient(player, pkt, entry.passthrough)
+			end
+		else
+			remote:FireAllClients(pkt, entry.passthrough)
+		end
+	end
+
+	-- Batch normal entries as before
+	if #normalEntries == 0 then
 		return
 	end
 
 	-- Group entries by target pattern to send correct packets to correct recipients
 	local groups: { [string]: { entries: { Batcher.BatchEntry }, sample: Batcher.BatchEntry } } = {}
 
-	for _, entry in entries do
-		local key: string
-		if entry.isFireAll then
-			key = "all"
-		elseif entry.excludePlayer then
+	for _, entry in normalEntries do
+		local key = "all"
+		if entry.excludePlayer then
 			key = "except:" .. tostring(entry.excludePlayer.UserId)
 		elseif entry.targets then
 			local ids = {}
@@ -179,8 +221,6 @@ function Signal._flushBatch(self: any, entries: { Batcher.BatchEntry })
 			end
 			table.sort(ids)
 			key = "players:" .. table.concat(ids, ",")
-		else
-			key = "all"
 		end
 
 		if not groups[key] then
@@ -203,9 +243,7 @@ function Signal._flushBatch(self: any, entries: { Batcher.BatchEntry })
 		local batchPkt = buildBatchPacket(allPackets)
 		local sample = group.sample
 
-		if sample.isFireAll then
-			remote:FireAllClients(batchPkt)
-		elseif sample.excludePlayer then
+		if sample.excludePlayer then
 			for _, player in Players:GetPlayers() do
 				if player ~= sample.excludePlayer then
 					remote:FireClient(player, batchPkt)
@@ -215,17 +253,19 @@ function Signal._flushBatch(self: any, entries: { Batcher.BatchEntry })
 			for _, player in sample.targets do
 				remote:FireClient(player, batchPkt)
 			end
+		else
+			remote:FireAllClients(batchPkt)
 		end
 	end
 end
 
-local function preparePayload(self: any, ...: any): (buffer, number)
+local function preparePayload(self: any, ...: any): (buffer, number, { any })
 	local opts = self._options :: Types.SignalOptions
 	local precision = opts.precision or 2
 	local lossy = opts.lossy or false
 	local compressionThreshold = opts.compressionThreshold or 64
 
-	local payload = Codec.encode(precision, lossy, ...)
+	local payload, passthrough = Codec.encode(precision, lossy, ...)
 	local rawSize = buffer.len(payload)
 	local flags: number = 0
 
@@ -259,7 +299,7 @@ local function preparePayload(self: any, ...: any): (buffer, number)
 		end
 	end
 
-	return payload, flags
+	return payload, flags, passthrough
 end
 
 -- Strict direction helpers
@@ -369,14 +409,14 @@ function Signal.Fire(self: any, player: Player, ...: any)
 		name = self._methodName or "",
 		service = self._serviceName or "",
 		player = nil,
-		payload = { ... },
+		payload = packArgs(...),
 		direction = "s2c",
 	}
 	if not Middleware.execute(context) then
 		return
 	end
 
-	local payload, flags = preparePayload(self, table.unpack(context.payload))
+	local payload, flags, passthrough = preparePayload(self, unpackArgs(context.payload))
 	local opts = self._options :: Types.SignalOptions
 
 	if opts.batched and Batcher.hasBatch(self._id) then
@@ -384,6 +424,7 @@ function Signal.Fire(self: any, player: Player, ...: any)
 			id = self._id,
 			flags = flags,
 			payload = payload,
+			passthrough = if #passthrough > 0 then passthrough else nil,
 			targets = { player },
 			excludePlayer = nil,
 			isFireAll = false,
@@ -395,7 +436,11 @@ function Signal.Fire(self: any, player: Player, ...: any)
 			print(string.format("[KirNet] %s.%s -> %s", self._serviceName or "?", self._methodName or "?", player.Name))
 		end
 
-		remote:FireClient(player, pkt)
+		if #passthrough > 0 then
+			remote:FireClient(player, pkt, passthrough)
+		else
+			remote:FireClient(player, pkt)
+		end
 	end
 end
 
@@ -411,14 +456,14 @@ function Signal.FireAll(self: any, ...: any)
 		name = self._methodName or "",
 		service = self._serviceName or "",
 		player = nil,
-		payload = { ... },
+		payload = packArgs(...),
 		direction = "s2c",
 	}
 	if not Middleware.execute(context) then
 		return
 	end
 
-	local payload, flags = preparePayload(self, table.unpack(context.payload))
+	local payload, flags, passthrough = preparePayload(self, unpackArgs(context.payload))
 	local opts = self._options :: Types.SignalOptions
 
 	if opts.batched and Batcher.hasBatch(self._id) then
@@ -426,13 +471,18 @@ function Signal.FireAll(self: any, ...: any)
 			id = self._id,
 			flags = flags,
 			payload = payload,
+			passthrough = if #passthrough > 0 then passthrough else nil,
 			targets = nil,
 			excludePlayer = nil,
 			isFireAll = true,
 		})
 	else
 		local pkt = buildPacket(self._id, flags, payload)
-		remote:FireAllClients(pkt)
+		if #passthrough > 0 then
+			remote:FireAllClients(pkt, passthrough)
+		else
+			remote:FireAllClients(pkt)
+		end
 	end
 end
 
@@ -448,14 +498,14 @@ function Signal.FireExcept(self: any, player: Player, ...: any)
 		name = self._methodName or "",
 		service = self._serviceName or "",
 		player = nil,
-		payload = { ... },
+		payload = packArgs(...),
 		direction = "s2c",
 	}
 	if not Middleware.execute(context) then
 		return
 	end
 
-	local payload, flags = preparePayload(self, table.unpack(context.payload))
+	local payload, flags, passthrough = preparePayload(self, unpackArgs(context.payload))
 	local opts = self._options :: Types.SignalOptions
 
 	if opts.batched and Batcher.hasBatch(self._id) then
@@ -463,6 +513,7 @@ function Signal.FireExcept(self: any, player: Player, ...: any)
 			id = self._id,
 			flags = flags,
 			payload = payload,
+			passthrough = if #passthrough > 0 then passthrough else nil,
 			targets = nil,
 			excludePlayer = player,
 			isFireAll = false,
@@ -471,7 +522,11 @@ function Signal.FireExcept(self: any, player: Player, ...: any)
 		local pkt = buildPacket(self._id, flags, payload)
 		for _, p in Players:GetPlayers() do
 			if p ~= player then
-				remote:FireClient(p, pkt)
+				if #passthrough > 0 then
+					remote:FireClient(p, pkt, passthrough)
+				else
+					remote:FireClient(p, pkt)
+				end
 			end
 		end
 	end
@@ -489,14 +544,14 @@ function Signal.FireList(self: any, players: { Player }, ...: any)
 		name = self._methodName or "",
 		service = self._serviceName or "",
 		player = nil,
-		payload = { ... },
+		payload = packArgs(...),
 		direction = "s2c",
 	}
 	if not Middleware.execute(context) then
 		return
 	end
 
-	local payload, flags = preparePayload(self, table.unpack(context.payload))
+	local payload, flags, passthrough = preparePayload(self, unpackArgs(context.payload))
 	local opts = self._options :: Types.SignalOptions
 
 	if opts.batched and Batcher.hasBatch(self._id) then
@@ -504,6 +559,7 @@ function Signal.FireList(self: any, players: { Player }, ...: any)
 			id = self._id,
 			flags = flags,
 			payload = payload,
+			passthrough = if #passthrough > 0 then passthrough else nil,
 			targets = players,
 			excludePlayer = nil,
 			isFireAll = false,
@@ -511,7 +567,11 @@ function Signal.FireList(self: any, players: { Player }, ...: any)
 	else
 		local pkt = buildPacket(self._id, flags, payload)
 		for _, p in players do
-			remote:FireClient(p, pkt)
+			if #passthrough > 0 then
+				remote:FireClient(p, pkt, passthrough)
+			else
+				remote:FireClient(p, pkt)
+			end
 		end
 	end
 end
@@ -528,16 +588,20 @@ function Signal.FireServer(self: any, ...: any)
 		name = self._methodName or "",
 		service = self._serviceName or "",
 		player = nil,
-		payload = { ... },
+		payload = packArgs(...),
 		direction = "c2s",
 	}
 	if not Middleware.execute(context) then
 		return
 	end
 
-	local payload, flags = preparePayload(self, table.unpack(context.payload))
+	local payload, flags, passthrough = preparePayload(self, unpackArgs(context.payload))
 	local pkt = buildPacket(self._id, flags, payload)
-	remote:FireServer(pkt)
+	if #passthrough > 0 then
+		remote:FireServer(pkt, passthrough)
+	else
+		remote:FireServer(pkt)
+	end
 end
 
 --- Connect a callback to listen for server broadcasts (ServerSignal, client only)
@@ -563,10 +627,11 @@ function Signal.Wait(self: any, timeout: number?): ...any
 	assertServerSignalOnClient(self, "Wait")
 	local thread = coroutine.running()
 	local timedOut = false
+	local timeoutValue = timeout or 0
 	table.insert(self._waitingThreads, thread)
 
 	if timeout then
-		task.delay(timeout, function()
+		task.delay(timeoutValue, function()
 			local idx = table.find(self._waitingThreads, thread)
 			if idx then
 				table.remove(self._waitingThreads, idx)
@@ -576,13 +641,13 @@ function Signal.Wait(self: any, timeout: number?): ...any
 		end)
 	end
 
-	local results = { coroutine.yield() }
+	local results = packArgs(coroutine.yield())
 
 	if timedOut then
-		error(string.format("[KirNet] ERROR: Signal:Wait() timed out after %d seconds.", timeout))
+		error(string.format("[KirNet] ERROR: Signal:Wait() timed out after %d seconds.", timeoutValue))
 	end
 
-	return table.unpack(results)
+	return unpackArgs(results)
 end
 
 --- Disconnect all callbacks (ServerSignal, client only)
@@ -599,19 +664,19 @@ end
 --- Internal: Dispatch received data to callbacks
 function Signal._dispatch(self: any, ...: any)
 	for _, cb in self._callbacks do
-		task.spawn(cb, ...)
+		task.spawn(cb :: (...any) -> (), ...)
 	end
 
 	local onceCbs = table.clone(self._onceCallbacks)
 	table.clear(self._onceCallbacks)
 	for _, cb in onceCbs do
-		task.spawn(cb, ...)
+		task.spawn(cb :: (...any) -> (), ...)
 	end
 
 	local waiting = table.clone(self._waitingThreads)
 	table.clear(self._waitingThreads)
 	for _, thread in waiting do
-		task.spawn(thread, ...)
+		task.spawn(thread :: thread, ...)
 	end
 end
 

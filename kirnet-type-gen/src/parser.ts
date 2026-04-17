@@ -16,6 +16,42 @@ function escapeForRegex(str: string): string {
 }
 
 /**
+ * Infer a Luau type from a literal value expression.
+ */
+function inferLiteralType(value: string): string {
+	if (value === "true" || value === "false") return "boolean";
+	if (value === "nil") return "any";
+	if (/^-?\d+(\.\d+)?$/.test(value)) return "number";
+	if (/^["']/.test(value)) return "string";
+	if (/^\{/.test(value)) return "any"; // table — can't infer element type
+	return "any";
+}
+
+/**
+ * Detect the `direction` option inside a CreateSignal(...) options table.
+ * Returns "server", "client", or null if not found / not CreateSignal.
+ */
+function detectDirectionOption(optionsText: string): "server" | "client" | null {
+	const m = optionsText.match(/direction\s*=\s*["'](server|client)["']/);
+	return m ? (m[1] as "server" | "client") : null;
+}
+
+/**
+ * Infer signal type name from constructor name and options text.
+ * Handles both legacy CreateServerSignal/CreateClientSignal and
+ * new CreateSignal({ direction = "server" }) patterns.
+ */
+function inferSignalKindFromConstructor(constructorText: string, optionsText: string): string {
+	if (constructorText.includes("CreateClientSignal")) return "ClientSignal";
+	if (constructorText.includes("CreateServerSignal")) return "ServerSignal";
+	// For CreateSignal, check the direction option
+	const dir = detectDirectionOption(optionsText);
+	if (dir === "server") return "ServerSignal";
+	if (dir === "client") return "ClientSignal";
+	return "Signal";
+}
+
+/**
  * Strip trailing inline comment (-- ...) from a line,
  * respecting string literals so `--` inside strings is preserved.
  */
@@ -133,9 +169,9 @@ export function parseFile(
 	// Detect the variable name used for KirNet (e.g. KirNet, Kirnet, kirnet)
 	const kirnetVar = detectKirNetVar(content);
 
-	// Match VarName.RegisterService("Name", { ... })
+	// Match VarName.RegisterService("Name", { ... }) and legacy VarName:RegisterService("Name", { ... })
 	const registerPattern = new RegExp(
-		`${escapeForRegex(kirnetVar)}\\s*\\.\\s*RegisterService\\s*\\(\\s*["']([^"']+)["']\\s*,\\s*\\{`,
+		`${escapeForRegex(kirnetVar)}\\s*(?:\\.|:)\\s*RegisterService\\s*\\(\\s*["']([^"']+)["']\\s*,\\s*\\{`,
 		"g",
 	);
 
@@ -357,6 +393,64 @@ function parseDefinitionTable(
 			continue;
 		}
 
+		// ── CreateVariable: KeyName = VarName.CreateVariable(value) [:: VarName.Variable<T>] ──
+		const createVarStart = trimmed.match(
+			new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateVariable\\s*\\(`),
+		);
+		if (createVarStart) {
+			const fieldName = createVarStart[1];
+			const absOffset = bodyOffset + lineOffset;
+			const actualIdx = fullContent.indexOf("CreateVariable", absOffset);
+			if (actualIdx !== -1) {
+				const parenOpen = fullContent.indexOf("(", actualIdx);
+				if (parenOpen !== -1) {
+					const parenClose = findMatchingParen(fullContent, parenOpen);
+					if (parenClose !== -1) {
+						const afterParen = fullContent.substring(parenClose + 1);
+						const castMatch = afterParen.match(
+							new RegExp(`^[\\s\\n]*::[\\s\\n]*(?:${v}[\\s\\n]*\\.[\\s\\n]*)?Variable[\\s\\n]*<`),
+						);
+
+						let varField: FieldDef;
+						let exprEnd: number;
+
+						if (castMatch) {
+							const angleOpen = parenClose + 1 + castMatch[0].length - 1;
+							const angleClose = findMatchingAngle(fullContent, angleOpen);
+							if (angleClose !== -1) {
+								const typeArg = fullContent
+									.substring(angleOpen + 1, angleClose)
+									.replace(/[\s\n]+/g, " ")
+									.trim();
+								varField = { name: fieldName, type: `Variable<${typeArg}>` };
+								exprEnd = angleClose + 1;
+							} else {
+								varField = { name: fieldName, type: "Variable<any>" };
+								exprEnd = parenClose + 1;
+							}
+						} else {
+							// Infer type from initial value
+							const initValue = fullContent.substring(parenOpen + 1, parenClose).trim();
+							const inferredType = inferLiteralType(initValue);
+							varField = { name: fieldName, type: `Variable<${inferredType}>` };
+							exprEnd = parenClose + 1;
+						}
+
+						fields.push(varField);
+						if (isDebug) {
+							logger.debug(`  ${serviceName}.${varField.name} → ${varField.type}`, true);
+						}
+
+						while (i < lines.length && bodyOffset + lineOffset < exprEnd) {
+							lineOffset += lines[i].length + 1;
+							i++;
+						}
+						continue;
+					}
+				}
+			}
+		}
+
 		// ── CreateServerSignal / CreateClientSignal / CreateSignal: check fullContent-based first ──
 		const createSignalStart = trimmed.match(
 			new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerSignal|CreateClientSignal|CreateSignal)\\s*\\(`),
@@ -395,36 +489,23 @@ function parseDefinitionTable(
 								} else if (castText.includes("ServerSignal")) {
 									signalTypeName = "ServerSignal";
 								} else if (castText.includes("Signal")) {
-									// Signal<T> cast — infer direction from constructor if specified
 									const constructorText = fullContent.substring(absOffset, parenOpen);
-									if (constructorText.includes("CreateClientSignal")) {
-										signalTypeName = "ClientSignal";
-									} else if (constructorText.includes("CreateServerSignal")) {
-										signalTypeName = "ServerSignal";
-									}
+									const optionsText = fullContent.substring(parenOpen + 1, parenClose);
+									signalTypeName = inferSignalKindFromConstructor(constructorText, optionsText);
 								}
 								signalField = { name: fieldName, type: `${signalTypeName}<${typeArgs}>` };
 								exprEnd = angleClose + 1;
 							} else {
-								// Determine from constructor name
 								const constructorText = fullContent.substring(absOffset, parenOpen);
-								let fallbackType = "Signal";
-								if (constructorText.includes("CreateClientSignal")) {
-									fallbackType = "ClientSignal";
-								} else if (constructorText.includes("CreateServerSignal")) {
-									fallbackType = "ServerSignal";
-								}
+								const optionsText = fullContent.substring(parenOpen + 1, parenClose);
+								const fallbackType = inferSignalKindFromConstructor(constructorText, optionsText);
 								signalField = { name: fieldName, type: `${fallbackType}<any>` };
 								exprEnd = parenClose + 1;
 							}
 						} else {
 							const constructorText = fullContent.substring(absOffset, parenOpen);
-							let untypedType = "Signal";
-							if (constructorText.includes("CreateClientSignal")) {
-								untypedType = "ClientSignal";
-							} else if (constructorText.includes("CreateServerSignal")) {
-								untypedType = "ServerSignal";
-							}
+							const optionsText = fullContent.substring(parenOpen + 1, parenClose);
+							const untypedType = inferSignalKindFromConstructor(constructorText, optionsText);
 							signalField = { name: fieldName, type: `${untypedType}<any>` };
 							exprEnd = parenClose + 1;
 						}
@@ -663,6 +744,26 @@ function tryParseField(
 ): FieldDef | null {
 	const v = escapeForRegex(kirnetVar);
 
+	// Case: Typed variable — KeyName = VarName.CreateVariable(...) :: [VarName.]Variable<T>
+	const typedVarMatch = line.match(
+		new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateVariable\\s*\\(.*?\\)\\s*::\\s*(?:${v}\\s*\\.\\s*)?Variable\\s*<(.+)>\\s*,?\\s*$`),
+	);
+	if (typedVarMatch) {
+		const name = typedVarMatch[1];
+		const typeArg = typedVarMatch[2].trim();
+		return { name, type: `Variable<${typeArg}>` };
+	}
+
+	// Case: Untyped variable — KeyName = VarName.CreateVariable(value)
+	const untypedVarMatch = line.match(
+		new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateVariable\\s*\\((.+?)\\)\\s*,?\\s*$`),
+	);
+	if (untypedVarMatch) {
+		const name = untypedVarMatch[1];
+		const inferredType = inferLiteralType(untypedVarMatch[2].trim());
+		return { name, type: `Variable<${inferredType}>` };
+	}
+
 	// Case 1/2: Typed signal — KeyName = VarName.Create(Server|Client)Signal(...) :: [VarName.](Server|Client)Signal<T>
 	const typedSignalMatch = line.match(
 		new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerSignal|CreateClientSignal|CreateSignal)\\s*\\(.*?\\)\\s*::\\s*((?:${v}\\s*\\.\\s*)?(?:ServerSignal|ClientSignal|Signal)\\s*<(.+)>)\\s*,?\\s*$`),
@@ -672,15 +773,13 @@ function tryParseField(
 		const rawType = typedSignalMatch[2];
 		// Normalize whitespace and strip module prefix
 		let type = rawType.replace(/\s+/g, " ").replace(new RegExp(`${v}\\s*\\.\\s*`, "g"), "").trim();
-		// If cast used Signal<T>, infer direction from constructor
+		// If cast used Signal<T>, infer direction from constructor or options
 		if (type.startsWith("Signal<")) {
 			const innerType = typedSignalMatch[3];
-			if (line.includes("CreateClientSignal")) {
-				type = `ClientSignal<${innerType}>`;
-			} else if (line.includes("CreateServerSignal")) {
-				type = `ServerSignal<${innerType}>`;
+			const kind = inferSignalKindFromConstructor(line, line);
+			if (kind !== "Signal") {
+				type = `${kind}<${innerType}>`;
 			}
-			// else keep as Signal<T> (bidirectional)
 		}
 		return { name, type };
 	}
@@ -691,12 +790,7 @@ function tryParseField(
 	);
 	if (untypedSignalMatch) {
 		const name = untypedSignalMatch[1];
-		let signalKind = "Signal";
-		if (line.includes("CreateClientSignal")) {
-			signalKind = "ClientSignal";
-		} else if (line.includes("CreateServerSignal")) {
-			signalKind = "ServerSignal";
-		}
+		const signalKind = inferSignalKindFromConstructor(line, line);
 		return { name, type: `${signalKind}<any>` };
 	}
 

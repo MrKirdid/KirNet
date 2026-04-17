@@ -1,4 +1,4 @@
-﻿--!strict
+--!strict
 
 --[[
 	Registry.luau - Stores registered services and their remotes.
@@ -14,11 +14,11 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
-local Types = require(script.Parent.Types)
 local Router = require(script.Parent.Router)
 local Codec = require(script.Parent.Codec)
 local Signal = require(script.Parent.Signal)
 local KirFunction = require(script.Parent.Function)
+local Variable = require(script.Parent.Variable)
 
 local IS_SERVER = RunService:IsServer()
 
@@ -36,6 +36,12 @@ local _clientReady = false
 -- Route type map: routeId -> MemberKind (client-side, received from server)
 local _routeTypes: { [number]: string } = {}
 
+-- Route options map: routeId -> SignalOptions (client-side, received from server)
+local _routeOptions: { [number]: { [string]: any } } = {}
+
+-- Variable initial values: routeId -> initialValue (client-side, received from server)
+local _variableInitials: { [number]: any } = {}
+
 -- The container folder for KirNet remotes
 local FOLDER_NAME = "__KirNet"
 
@@ -50,6 +56,7 @@ function Registry.setDebug(enabled: boolean)
 	_debugEnabled = enabled
 	Signal.setDebug(enabled)
 	KirFunction.setDebug(enabled)
+	Variable.setDebug(enabled)
 end
 
 local function getOrCreateFolder(): Folder
@@ -96,6 +103,7 @@ local function ensureRemotes()
 
 	if _remoteEvent then
 		Signal.setRemoteEvent(_remoteEvent)
+		Variable.setRemoteEvent(_remoteEvent)
 	end
 	if _remoteFunction then
 		KirFunction.setRemoteFunction(_remoteFunction)
@@ -114,49 +122,61 @@ local function setupServerListeners()
 	local remoteFunction = _remoteFunction
 
 	if remoteEvent then
-		remoteEvent.OnServerEvent:Connect(function(player: Player, data: any)
+		remoteEvent.OnServerEvent:Connect(function(player: Player, data: any, passthroughRaw: any)
 			if typeof(data) ~= "buffer" then
 				return
 			end
 			local pkt = data :: buffer
+			local pt = if typeof(passthroughRaw) == "table" then passthroughRaw else nil
 
 			if Signal.isBatch(pkt) then
 				local packets = Signal.parseBatch(pkt)
 				for _, subPkt in packets do
 					local routeId, _, payload = Signal.parsePacket(subPkt)
 					local handler = _routeHandlers[routeId]
+					if handler and handler._isVariable then
+						continue -- Variables don't accept client input
+					end
 					if handler and handler._callbacks then
 						if handler._checkRate and not handler:_checkRate(player) then
 							continue
 						end
-						handler:_dispatch(player, Codec.decode(payload))
+						local hopts = handler._options
+						local hp = if hopts and hopts.lossy then hopts.precision or 2 else nil
+						handler:_dispatch(player, Codec.decode(payload, hp))
 					end
 				end
 			else
 				local routeId, _, payload = Signal.parsePacket(pkt)
 				local handler = _routeHandlers[routeId]
+				if handler and handler._isVariable then
+					return -- Variables don't accept client input
+				end
 				if handler and handler._callbacks then
 					if handler._checkRate and not handler:_checkRate(player) then
 						return
 					end
-					handler:_dispatch(player, Codec.decode(payload))
+					local hopts = handler._options
+					local hp = if hopts and hopts.lossy then hopts.precision or 2 else nil
+					handler:_dispatch(player, Codec.decode(payload, hp, pt))
 				end
 			end
 		end)
 	end
 
 	if remoteFunction then
-		remoteFunction.OnServerInvoke = function(player: Player, data: any): any
+		remoteFunction.OnServerInvoke = function(player: Player, data: any, passthroughRaw: any): (any, any)
 			if typeof(data) ~= "buffer" then
-				return nil
+				return nil, nil
 			end
 			local pkt = data :: buffer
+			local pt = if typeof(passthroughRaw) == "table" then passthroughRaw else nil
 			local routeId = buffer.readu16(pkt, 0)
 			local handler = _routeHandlers[routeId]
 			if handler and handler._handleInvoke then
-				return handler:_handleInvoke(player, pkt)
+				return handler:_handleInvoke(player, pkt, pt)
 			end
-			return nil
+			return nil, nil
 		end
 	end
 end
@@ -186,6 +206,28 @@ local function setupClientListeners()
 						end
 					end
 
+					-- Import route options
+					local opts = routingTable._options :: { [string]: { [string]: any } }?
+					if opts then
+						for routeIdStr, routeOpts in opts do
+							local routeId = tonumber(routeIdStr)
+							if routeId then
+								_routeOptions[routeId] = routeOpts
+							end
+						end
+					end
+
+					-- Import variable initial values
+					local vars = routingTable._variables :: { [string]: any }?
+					if vars then
+						for routeIdStr, value in vars do
+							local routeId = tonumber(routeIdStr)
+							if routeId then
+								_variableInitials[routeId] = value
+							end
+						end
+					end
+
 					-- Import routes
 					for serviceName, methods in serviceNames do
 						for methodName, routeId in methods do
@@ -207,11 +249,12 @@ local function setupClientListeners()
 	end
 
 	if remoteEvent then
-		remoteEvent.OnClientEvent:Connect(function(data: any)
+		remoteEvent.OnClientEvent:Connect(function(data: any, passthroughRaw: any)
 			if typeof(data) ~= "buffer" then
 				return
 			end
 			local pkt = data :: buffer
+			local pt = if typeof(passthroughRaw) == "table" then passthroughRaw else nil
 
 			if Signal.isBatch(pkt) then
 				local packets = Signal.parseBatch(pkt)
@@ -219,14 +262,18 @@ local function setupClientListeners()
 					local routeId, _, payload = Signal.parsePacket(subPkt)
 					local handler = _routeHandlers[routeId]
 					if handler and handler._dispatch then
-						handler:_dispatch(Codec.decode(payload))
+						local hopts = handler._options
+						local hp = if hopts and hopts.lossy then hopts.precision or 2 else nil
+						handler:_dispatch(Codec.decode(payload, hp))
 					end
 				end
 			else
 				local routeId, _, payload = Signal.parsePacket(pkt)
 				local handler = _routeHandlers[routeId]
 				if handler and handler._dispatch then
-					handler:_dispatch(Codec.decode(payload))
+					local hopts = if handler._options then handler._options else nil
+					local hp = if hopts and hopts.lossy then hopts.precision or 2 else nil
+					handler:_dispatch(Codec.decode(payload, hp, pt))
 				end
 			end
 		end)
@@ -258,6 +305,8 @@ local function replicateRoutingTable(player: Player?)
 
 	local serviceData: { [string]: { [string]: number } } = {}
 	local typeData: { [string]: string } = {}
+	local optionsData: { [string]: { [string]: any } } = {}
+	local variableData: { [string]: any } = {}
 	for serviceName, methods in _services do
 		serviceData[serviceName] = {}
 		for methodName, impl in methods do
@@ -265,7 +314,11 @@ local function replicateRoutingTable(player: Player?)
 				serviceData[serviceName][methodName] = impl._id
 				-- Determine member kind for type info
 				local memberKind: string
-				if impl._callbacks then
+				if impl._isVariable then
+					memberKind = "variable"
+					-- Include current variable value for initial sync
+					variableData[tostring(impl._id)] = impl._value
+				elseif impl._callbacks then
 					-- It's a signal
 					if impl._kind == "server" then
 						memberKind = "serverSignal"
@@ -278,11 +331,32 @@ local function replicateRoutingTable(player: Player?)
 					memberKind = "serverFunction"
 				end
 				typeData[tostring(impl._id)] = memberKind
+
+				-- Replicate encoding-relevant options to the client
+				local opts = impl._options
+				if opts then
+					local replicatedOpts: { [string]: any } = {}
+					if opts.lossy then
+						replicatedOpts.lossy = true
+					end
+					if opts.precision then
+						replicatedOpts.precision = opts.precision
+					end
+					if opts.compressionThreshold then
+						replicatedOpts.compressionThreshold = opts.compressionThreshold
+					end
+					if opts.batched then
+						replicatedOpts.batched = true
+					end
+					if next(replicatedOpts) then
+						optionsData[tostring(impl._id)] = replicatedOpts
+					end
+				end
 			end
 		end
 	end
 
-	local payload = { _services = serviceData, _types = typeData }
+	local payload = { _services = serviceData, _types = typeData, _options = optionsData, _variables = variableData }
 
 	if player then
 		_routingRemote:FireClient(player, payload)
@@ -298,23 +372,23 @@ local function validateServiceDefinition(name: string, definition: { [string]: a
 			error(string.format('[KirNet] Service "%s" has a non-string method key: %s', name, tostring(methodName)))
 		end
 
-		-- Check that it's a KirNet signal or function (has _init method from metatable)
+		-- Check that it's a KirNet signal, function, or variable (has _init method from metatable)
 		local mt = getmetatable(impl)
 		if not mt then
 			error(
 				string.format(
-					'[KirNet] Service "%s".%s is not a valid KirNet member. Use CreateServerSignal(), CreateClientSignal(), or CreateServerFunction() to create members.',
+					'[KirNet] Service "%s".%s is not a valid KirNet member. Use CreateSignal(), CreateFunction(), or CreateVariable() to create members.',
 					name,
 					methodName
 				)
 			)
 		end
 
-		-- Verify it has _init (signals and functions both have this)
+		-- Verify it has _init (signals, functions, and variables all have this)
 		if typeof(impl._init) ~= "function" then
 			error(
 				string.format(
-					'[KirNet] Service "%s".%s is not a valid KirNet member. Expected a signal or function created via KirNet API.',
+					'[KirNet] Service "%s".%s is not a valid KirNet member. Expected a signal, function, or variable created via KirNet API.',
 					name,
 					methodName
 				)
@@ -412,16 +486,20 @@ function Registry.getService(name: string, timeout: number?): { [string]: any }
 				else
 					-- Create client-side proxy based on member kind from routing table
 					local memberKind = _routeTypes[routeId]
+					local routeOpts = _routeOptions[routeId]
 					local proxy
-					if memberKind == "serverFunction" then
-						proxy = KirFunction.new(nil)
+					if memberKind == "variable" then
+						local initialValue = _variableInitials[routeId]
+						proxy = Variable.new(initialValue)
+					elseif memberKind == "serverFunction" then
+						proxy = KirFunction.new(nil, routeOpts)
 					elseif memberKind == "clientSignal" then
-						proxy = Signal.new("client")
+						proxy = Signal.new("client", routeOpts)
 					elseif memberKind == "signal" then
-						proxy = Signal.new("signal")
+						proxy = Signal.new("signal", routeOpts)
 					else
 						-- Default: serverSignal (server-to-client)
-						proxy = Signal.new("server")
+						proxy = Signal.new("server", routeOpts)
 					end
 					proxy:_init(svcName, methodName, routeId)
 					_routeHandlers[routeId] = proxy

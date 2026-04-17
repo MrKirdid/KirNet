@@ -20,7 +20,7 @@ export function generateTypesContent(
 	lines.push("-- Do not edit manually. This file is overwritten on every save.");
 	lines.push("--");
 	lines.push("-- Require this module instead of KirNet for fully typed GetService().");
-	lines.push("-- All other KirNet methods (CreateServerSignal, RegisterService, etc.) work as normal.");
+	lines.push("-- All other KirNet methods (CreateSignal, RegisterService, etc.) work as normal.");
 	lines.push("");
 	lines.push(`local KirNet = require(${requirePath})`);
 	lines.push("");
@@ -68,6 +68,12 @@ export function generateTypesContent(
 	lines.push("\tCall: (self: ServerFunction<TReturn>, ...any) -> TReturn,");
 	lines.push("}");
 	lines.push("");
+	lines.push("type Variable<T> = {");
+	lines.push("\tGet: (self: Variable<T>) -> T,");
+	lines.push("\tSet: (self: Variable<T>, value: T) -> (),");
+	lines.push("\tOnChanged: (self: Variable<T>, callback: (newValue: T, oldValue: T) -> ()) -> (),");
+	lines.push("}");
+	lines.push("");
 
 	// -- Service Types section
 	lines.push("-- ============================================================");
@@ -85,7 +91,8 @@ export function generateTypesContent(
 				.replace(/\bKirNet\s*\.\s*ClientSignal\s*</g, "ClientSignal<")
 				.replace(/\bKirNet\s*\.\s*ServerFunction\s*</g, "ServerFunction<")
 				.replace(/\bKirNet\s*\.\s*Signal\s*</g, "Signal<")
-				.replace(/\bKirNet\s*\.\s*Function\s*</g, "ServerFunction<");
+				.replace(/\bKirNet\s*\.\s*Function\s*</g, "ServerFunction<")
+				.replace(/\bKirNet\s*\.\s*Variable\s*</g, "Variable<");
 			lines.push(`\t${field.name}: ${fieldType},`);
 		}
 		lines.push("}");
@@ -121,11 +128,9 @@ export function generateTypesContent(
 	lines.push("type TypedKirNet = {");
 	lines.push("\tGetService: GetServiceOverloads,");
 	lines.push("\tRegisterService: RegisterServiceOverloads,");
-	lines.push("\tCreateServerSignal: typeof(KirNet.CreateServerSignal),");
-	lines.push("\tCreateClientSignal: typeof(KirNet.CreateClientSignal),");
 	lines.push("\tCreateSignal: typeof(KirNet.CreateSignal),");
-	lines.push("\tCreateServerFunction: typeof(KirNet.CreateServerFunction),");
 	lines.push("\tCreateFunction: typeof(KirNet.CreateFunction),");
+	lines.push("\tCreateVariable: typeof(KirNet.CreateVariable),");
 	lines.push("\tUseMiddleware: typeof(KirNet.UseMiddleware),");
 	lines.push("\tSetDebug: typeof(KirNet.SetDebug),");
 	lines.push("}");

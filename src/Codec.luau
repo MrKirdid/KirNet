@@ -14,6 +14,7 @@
 		UDim2 — 4× f32
 		nil — tag only
 		table — recursive type-tagged key/value pairs
+		Instance/userdata — passthrough (sent alongside buffer, not encoded)
 ]]
 
 local Codec = {}
@@ -33,6 +34,7 @@ local TAG_CFRAME = 10
 local TAG_COLOR3 = 11
 local TAG_UDIM2 = 12
 local TAG_TABLE = 13
+local TAG_PASSTHROUGH = 14
 
 local function roundToPrecision(value: number, precision: number): number
 	local mult = 10 ^ precision
@@ -54,8 +56,15 @@ local function ensureSize(buf: buffer, needed: number): buffer
 end
 
 -- Forward declarations for recursive table support
-local writeValue: (buf: buffer, cursor: number, value: any, precision: number, lossy: boolean) -> (buffer, number)
-local readValue: (buf: buffer, cursor: number) -> (any, number)
+local writeValue: (
+	buf: buffer,
+	cursor: number,
+	value: any,
+	precision: number,
+	lossy: boolean,
+	passthrough: { any }
+) -> (buffer, number)
+local readValue: (buf: buffer, cursor: number, precision: number?, passthrough: { any }?) -> (any, number)
 
 local function writeTag(buf: buffer, cursor: number, tag: number): (buffer, number)
 	buf = ensureSize(buf, cursor + 1)
@@ -110,7 +119,13 @@ local function writeString(buf: buffer, cursor: number, value: string): (buffer,
 	return buf, cursor + len
 end
 
-local function writeNumber(buf: buffer, cursor: number, value: number, lossy: boolean): (buffer, number)
+local function writeNumber(
+	buf: buffer,
+	cursor: number,
+	value: number,
+	precision: number,
+	lossy: boolean
+): (buffer, number)
 	-- Integer check
 	if value == math.floor(value) and value == value then
 		if value >= -128 and value <= 127 then
@@ -125,16 +140,24 @@ local function writeNumber(buf: buffer, cursor: number, value: number, lossy: bo
 		end
 	end
 	-- Float
+	local rounded = if lossy then roundToPrecision(value, precision) else value
 	if lossy then
 		buf, cursor = writeTag(buf, cursor, TAG_F32)
-		return writeF32(buf, cursor, value)
+		return writeF32(buf, cursor, rounded)
 	else
 		buf, cursor = writeTag(buf, cursor, TAG_F64)
-		return writeF64(buf, cursor, value)
+		return writeF64(buf, cursor, rounded)
 	end
 end
 
-function writeValue(buf: buffer, cursor: number, value: any, precision: number, lossy: boolean): (buffer, number)
+function writeValue(
+	buf: buffer,
+	cursor: number,
+	value: any,
+	precision: number,
+	lossy: boolean,
+	passthrough: { any }
+): (buffer, number)
 	if value == nil then
 		return writeTag(buf, cursor, TAG_NIL)
 	end
@@ -145,7 +168,7 @@ function writeValue(buf: buffer, cursor: number, value: any, precision: number, 
 		buf, cursor = writeTag(buf, cursor, TAG_BOOL)
 		return writeBool(buf, cursor, value)
 	elseif t == "number" then
-		return writeNumber(buf, cursor, value, lossy)
+		return writeNumber(buf, cursor, value, precision, lossy)
 	elseif t == "string" then
 		buf, cursor = writeTag(buf, cursor, TAG_STRING)
 		return writeString(buf, cursor, value)
@@ -205,10 +228,14 @@ function writeValue(buf: buffer, cursor: number, value: any, precision: number, 
 			qy = (r12 + r21) / s
 			qz = 0.25 * s
 		end
-		buf, cursor = writeF32(buf, cursor, qx)
-		buf, cursor = writeF32(buf, cursor, qy)
-		buf, cursor = writeF32(buf, cursor, qz)
-		return writeF32(buf, cursor, qw)
+		local rqx = if lossy then roundToPrecision(qx, precision) else qx
+		local rqy = if lossy then roundToPrecision(qy, precision) else qy
+		local rqz = if lossy then roundToPrecision(qz, precision) else qz
+		local rqw = if lossy then roundToPrecision(qw, precision) else qw
+		buf, cursor = writeF32(buf, cursor, rqx)
+		buf, cursor = writeF32(buf, cursor, rqy)
+		buf, cursor = writeF32(buf, cursor, rqz)
+		return writeF32(buf, cursor, rqw)
 	elseif t == "Color3" then
 		buf, cursor = writeTag(buf, cursor, TAG_COLOR3)
 		local c = value :: Color3
@@ -220,10 +247,14 @@ function writeValue(buf: buffer, cursor: number, value: any, precision: number, 
 	elseif t == "UDim2" then
 		buf, cursor = writeTag(buf, cursor, TAG_UDIM2)
 		local u = value :: UDim2
-		buf, cursor = writeF32(buf, cursor, u.X.Scale)
-		buf, cursor = writeF32(buf, cursor, u.X.Offset)
-		buf, cursor = writeF32(buf, cursor, u.Y.Scale)
-		return writeF32(buf, cursor, u.Y.Offset)
+		local xs = if lossy then roundToPrecision(u.X.Scale, precision) else u.X.Scale
+		local xo = if lossy then roundToPrecision(u.X.Offset, precision) else u.X.Offset
+		local ys = if lossy then roundToPrecision(u.Y.Scale, precision) else u.Y.Scale
+		local yo = if lossy then roundToPrecision(u.Y.Offset, precision) else u.Y.Offset
+		buf, cursor = writeF32(buf, cursor, xs)
+		buf, cursor = writeF32(buf, cursor, xo)
+		buf, cursor = writeF32(buf, cursor, ys)
+		return writeF32(buf, cursor, yo)
 	elseif t == "table" then
 		buf, cursor = writeTag(buf, cursor, TAG_TABLE)
 		-- Count entries
@@ -235,22 +266,23 @@ function writeValue(buf: buffer, cursor: number, value: any, precision: number, 
 		buffer.writeu32(buf, cursor, count)
 		cursor += 4
 		for k, v in value do
-			buf, cursor = writeValue(buf, cursor, k, precision, lossy)
-			buf, cursor = writeValue(buf, cursor, v, precision, lossy)
+			buf, cursor = writeValue(buf, cursor, k, precision, lossy, passthrough)
+			buf, cursor = writeValue(buf, cursor, v, precision, lossy, passthrough)
 		end
 		return buf, cursor
 	end
 
-	error(
-		string.format(
-			"[KirNet] Codec error: unsupported type '%s' (value: %s). Supported types: nil, boolean, number, string, Vector3, Vector2, CFrame, Color3, UDim2, table.",
-			tostring(typeof(value)),
-			tostring(value)
-		)
-	)
+	-- Passthrough for unsupported types (Instance, userdata, etc.)
+	-- These values are sent alongside the buffer, not encoded into it.
+	local ptIdx = #passthrough + 1
+	table.insert(passthrough, value)
+	buf, cursor = writeTag(buf, cursor, TAG_PASSTHROUGH)
+	buf = ensureSize(buf, cursor + 2)
+	buffer.writeu16(buf, cursor, ptIdx)
+	return buf, cursor + 2
 end
 
-function readValue(buf: buffer, cursor: number): (any, number)
+function readValue(buf: buffer, cursor: number, precision: number?, passthrough: { any }?): (any, number)
 	local tag = buffer.readu8(buf, cursor)
 	cursor += 1
 
@@ -266,7 +298,11 @@ function readValue(buf: buffer, cursor: number): (any, number)
 	elseif tag == TAG_INT32 then
 		return buffer.readi32(buf, cursor), cursor + 4
 	elseif tag == TAG_F32 then
-		return buffer.readf32(buf, cursor), cursor + 4
+		local v = buffer.readf32(buf, cursor)
+		if precision then
+			v = roundToPrecision(v, precision)
+		end
+		return v, cursor + 4
 	elseif tag == TAG_F64 then
 		return buffer.readf64(buf, cursor), cursor + 8
 	elseif tag == TAG_STRING then
@@ -278,10 +314,19 @@ function readValue(buf: buffer, cursor: number): (any, number)
 		local x = buffer.readf32(buf, cursor)
 		local y = buffer.readf32(buf, cursor + 4)
 		local z = buffer.readf32(buf, cursor + 8)
+		if precision then
+			x = roundToPrecision(x, precision)
+			y = roundToPrecision(y, precision)
+			z = roundToPrecision(z, precision)
+		end
 		return Vector3.new(x, y, z), cursor + 12
 	elseif tag == TAG_VECTOR2 then
 		local x = buffer.readf32(buf, cursor)
 		local y = buffer.readf32(buf, cursor + 4)
+		if precision then
+			x = roundToPrecision(x, precision)
+			y = roundToPrecision(y, precision)
+		end
 		return Vector2.new(x, y), cursor + 8
 	elseif tag == TAG_CFRAME then
 		local px = buffer.readf32(buf, cursor)
@@ -293,6 +338,15 @@ function readValue(buf: buffer, cursor: number): (any, number)
 		local qz = buffer.readf32(buf, cursor + 8)
 		local qw = buffer.readf32(buf, cursor + 12)
 		cursor += 16
+		if precision then
+			px = roundToPrecision(px, precision)
+			py = roundToPrecision(py, precision)
+			pz = roundToPrecision(pz, precision)
+			qx = roundToPrecision(qx, precision)
+			qy = roundToPrecision(qy, precision)
+			qz = roundToPrecision(qz, precision)
+			qw = roundToPrecision(qw, precision)
+		end
 		-- Quaternion → rotation matrix
 		local x2 = qx * 2
 		local y2 = qy * 2
@@ -331,6 +385,12 @@ function readValue(buf: buffer, cursor: number): (any, number)
 		local xo = buffer.readf32(buf, cursor + 4)
 		local ys = buffer.readf32(buf, cursor + 8)
 		local yo = buffer.readf32(buf, cursor + 12)
+		if precision then
+			xs = roundToPrecision(xs, precision)
+			xo = roundToPrecision(xo, precision)
+			ys = roundToPrecision(ys, precision)
+			yo = roundToPrecision(yo, precision)
+		end
 		return UDim2.new(xs, xo, ys, yo), cursor + 16
 	elseif tag == TAG_TABLE then
 		local count = buffer.readu32(buf, cursor)
@@ -338,21 +398,31 @@ function readValue(buf: buffer, cursor: number): (any, number)
 		local tbl = {}
 		for _ = 1, count do
 			local k, v
-			k, cursor = readValue(buf, cursor)
-			v, cursor = readValue(buf, cursor)
+			k, cursor = readValue(buf, cursor, precision, passthrough)
+			v, cursor = readValue(buf, cursor, precision, passthrough)
 			tbl[k] = v
 		end
 		return tbl, cursor
+	elseif tag == TAG_PASSTHROUGH then
+		local idx = buffer.readu16(buf, cursor)
+		cursor += 2
+		if passthrough and passthrough[idx] then
+			return passthrough[idx], cursor
+		end
+		return nil, cursor
 	end
 
 	error(string.format("[KirNet] Unknown codec tag: %d at cursor %d", tag, cursor - 1))
 end
 
 --- Encode a variadic list of values into a buffer.
-function Codec.encode(precision: number, lossy: boolean, ...: any): buffer
+--- Returns the buffer and a list of passthrough values (Instance, userdata, etc.)
+--- that could not be buffer-encoded and must be sent alongside.
+function Codec.encode(precision: number, lossy: boolean, ...: any): (buffer, { any })
 	local argCount = select("#", ...)
 	local buf = buffer.create(64)
 	local cursor = 0
+	local passthrough: { any } = {}
 
 	-- Write arg count
 	buf = ensureSize(buf, 4)
@@ -361,20 +431,22 @@ function Codec.encode(precision: number, lossy: boolean, ...: any): buffer
 
 	for i = 1, argCount do
 		local v = select(i, ...)
-		buf, cursor = writeValue(buf, cursor, v, precision, lossy)
+		buf, cursor = writeValue(buf, cursor, v, precision, lossy, passthrough)
 	end
 
 	-- Trim to exact size
 	if cursor < buffer.len(buf) then
 		local trimmed = buffer.create(cursor)
 		buffer.copy(trimmed, 0, buf, 0, cursor)
-		return trimmed
+		return trimmed, passthrough
 	end
-	return buf
+	return buf, passthrough
 end
 
 --- Decode a buffer into a variadic list of values.
-function Codec.decode(buf: buffer): ...any
+--- When precision is provided, f32 values are re-rounded to compensate for IEEE 754 representation error.
+--- When passthrough is provided, TAG_PASSTHROUGH entries are resolved from the passthrough table.
+function Codec.decode(buf: buffer, precision: number?, passthrough: { any }?): ...any
 	local cursor = 0
 	local argCount = buffer.readu32(buf, cursor)
 	cursor = 4
@@ -382,7 +454,7 @@ function Codec.decode(buf: buffer): ...any
 	local results = table.create(argCount)
 	for i = 1, argCount do
 		local val
-		val, cursor = readValue(buf, cursor)
+		val, cursor = readValue(buf, cursor, precision, passthrough)
 		results[i] = val
 	end
 

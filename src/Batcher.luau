@@ -16,6 +16,7 @@ export type BatchEntry = {
 	id: number,
 	flags: number,
 	payload: buffer,
+	passthrough: { any }?,
 	targets: { Player }?, -- nil = FireAll, empty = specific list
 	excludePlayer: Player?, -- for FireExcept
 	isFireAll: boolean,

@@ -7,6 +7,7 @@ import * as logger from "./logger";
 export interface KirNetConfig {
 	paths: {
 		services: string;
+		controllers: string;
 		output: string;
 		kirnet_package: string;
 	};
@@ -19,6 +20,7 @@ export interface KirNetConfig {
 const DEFAULTS: KirNetConfig = {
 	paths: {
 		services: "src",
+		controllers: "",
 		output: "src/ReplicatedStorage/Shared/Packages/KirNet/Types.luau",
 		kirnet_package: "",
 	},
@@ -45,6 +47,7 @@ export function readConfig(workspaceRoot: string): KirNetConfig {
 		return {
 			paths: {
 				services: typeof paths.services === "string" ? paths.services : DEFAULTS.paths.services,
+				controllers: typeof paths.controllers === "string" ? paths.controllers : DEFAULTS.paths.controllers,
 				output: typeof paths.output === "string" ? paths.output : DEFAULTS.paths.output,
 				kirnet_package: typeof paths.kirnet_package === "string" ? paths.kirnet_package : DEFAULTS.paths.kirnet_package,
 			},

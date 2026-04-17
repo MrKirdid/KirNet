@@ -2074,6 +2074,7 @@ function dispose() {
 var DEFAULTS = {
   paths: {
     services: "src",
+    controllers: "",
     output: "src/ReplicatedStorage/Shared/Packages/KirNet/Types.luau",
     kirnet_package: ""
   },
@@ -2095,6 +2096,7 @@ function readConfig(workspaceRoot2) {
     return {
       paths: {
         services: typeof paths.services === "string" ? paths.services : DEFAULTS.paths.services,
+        controllers: typeof paths.controllers === "string" ? paths.controllers : DEFAULTS.paths.controllers,
         output: typeof paths.output === "string" ? paths.output : DEFAULTS.paths.output,
         kirnet_package: typeof paths.kirnet_package === "string" ? paths.kirnet_package : DEFAULTS.paths.kirnet_package
       },
@@ -2118,6 +2120,26 @@ function detectKirNetVar(content) {
 }
 function escapeForRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function inferLiteralType(value) {
+  if (value === "true" || value === "false") return "boolean";
+  if (value === "nil") return "any";
+  if (/^-?\d+(\.\d+)?$/.test(value)) return "number";
+  if (/^["']/.test(value)) return "string";
+  if (/^\{/.test(value)) return "any";
+  return "any";
+}
+function detectDirectionOption(optionsText) {
+  const m = optionsText.match(/direction\s*=\s*["'](server|client)["']/);
+  return m ? m[1] : null;
+}
+function inferSignalKindFromConstructor(constructorText, optionsText) {
+  if (constructorText.includes("CreateClientSignal")) return "ClientSignal";
+  if (constructorText.includes("CreateServerSignal")) return "ServerSignal";
+  const dir = detectDirectionOption(optionsText);
+  if (dir === "server") return "ServerSignal";
+  if (dir === "client") return "ClientSignal";
+  return "Signal";
 }
 function stripInlineComment(line) {
   let inString = null;
@@ -2185,7 +2207,7 @@ function parseFile(content, filePath, isDebug) {
   const warnings = [];
   const kirnetVar = detectKirNetVar(content);
   const registerPattern = new RegExp(
-    `${escapeForRegex(kirnetVar)}\\s*\\.\\s*RegisterService\\s*\\(\\s*["']([^"']+)["']\\s*,\\s*\\{`,
+    `${escapeForRegex(kirnetVar)}\\s*(?:\\.|:)\\s*RegisterService\\s*\\(\\s*["']([^"']+)["']\\s*,\\s*\\{`,
     "g"
   );
   let match;
@@ -2356,6 +2378,54 @@ function parseDefinitionTable(tableBody, serviceName, filePath, bodyOffset, full
       i++;
       continue;
     }
+    const createVarStart = trimmed.match(
+      new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateVariable\\s*\\(`)
+    );
+    if (createVarStart) {
+      const fieldName = createVarStart[1];
+      const absOffset = bodyOffset + lineOffset;
+      const actualIdx = fullContent.indexOf("CreateVariable", absOffset);
+      if (actualIdx !== -1) {
+        const parenOpen = fullContent.indexOf("(", actualIdx);
+        if (parenOpen !== -1) {
+          const parenClose = findMatchingParen(fullContent, parenOpen);
+          if (parenClose !== -1) {
+            const afterParen = fullContent.substring(parenClose + 1);
+            const castMatch = afterParen.match(
+              new RegExp(`^[\\s\\n]*::[\\s\\n]*(?:${v}[\\s\\n]*\\.[\\s\\n]*)?Variable[\\s\\n]*<`)
+            );
+            let varField;
+            let exprEnd;
+            if (castMatch) {
+              const angleOpen = parenClose + 1 + castMatch[0].length - 1;
+              const angleClose = findMatchingAngle(fullContent, angleOpen);
+              if (angleClose !== -1) {
+                const typeArg = fullContent.substring(angleOpen + 1, angleClose).replace(/[\s\n]+/g, " ").trim();
+                varField = { name: fieldName, type: `Variable<${typeArg}>` };
+                exprEnd = angleClose + 1;
+              } else {
+                varField = { name: fieldName, type: "Variable<any>" };
+                exprEnd = parenClose + 1;
+              }
+            } else {
+              const initValue = fullContent.substring(parenOpen + 1, parenClose).trim();
+              const inferredType = inferLiteralType(initValue);
+              varField = { name: fieldName, type: `Variable<${inferredType}>` };
+              exprEnd = parenClose + 1;
+            }
+            fields.push(varField);
+            if (isDebug) {
+              debug(`  ${serviceName}.${varField.name} \u2192 ${varField.type}`, true);
+            }
+            while (i < lines.length && bodyOffset + lineOffset < exprEnd) {
+              lineOffset += lines[i].length + 1;
+              i++;
+            }
+            continue;
+          }
+        }
+      }
+    }
     const createSignalStart = trimmed.match(
       new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerSignal|CreateClientSignal|CreateSignal)\\s*\\(`)
     );
@@ -2388,33 +2458,22 @@ function parseDefinitionTable(tableBody, serviceName, filePath, bodyOffset, full
                   signalTypeName = "ServerSignal";
                 } else if (castText.includes("Signal")) {
                   const constructorText = fullContent.substring(absOffset, parenOpen);
-                  if (constructorText.includes("CreateClientSignal")) {
-                    signalTypeName = "ClientSignal";
-                  } else if (constructorText.includes("CreateServerSignal")) {
-                    signalTypeName = "ServerSignal";
-                  }
+                  const optionsText = fullContent.substring(parenOpen + 1, parenClose);
+                  signalTypeName = inferSignalKindFromConstructor(constructorText, optionsText);
                 }
                 signalField = { name: fieldName, type: `${signalTypeName}<${typeArgs}>` };
                 exprEnd = angleClose + 1;
               } else {
                 const constructorText = fullContent.substring(absOffset, parenOpen);
-                let fallbackType = "Signal";
-                if (constructorText.includes("CreateClientSignal")) {
-                  fallbackType = "ClientSignal";
-                } else if (constructorText.includes("CreateServerSignal")) {
-                  fallbackType = "ServerSignal";
-                }
+                const optionsText = fullContent.substring(parenOpen + 1, parenClose);
+                const fallbackType = inferSignalKindFromConstructor(constructorText, optionsText);
                 signalField = { name: fieldName, type: `${fallbackType}<any>` };
                 exprEnd = parenClose + 1;
               }
             } else {
               const constructorText = fullContent.substring(absOffset, parenOpen);
-              let untypedType = "Signal";
-              if (constructorText.includes("CreateClientSignal")) {
-                untypedType = "ClientSignal";
-              } else if (constructorText.includes("CreateServerSignal")) {
-                untypedType = "ServerSignal";
-              }
+              const optionsText = fullContent.substring(parenOpen + 1, parenClose);
+              const untypedType = inferSignalKindFromConstructor(constructorText, optionsText);
               signalField = { name: fieldName, type: `${untypedType}<any>` };
               exprEnd = parenClose + 1;
             }
@@ -2598,6 +2657,22 @@ function skipToMatchingEnd(lines, startLine) {
 }
 function tryParseField(line, serviceName, filePath, offsetInContent, fullContent, warnings, kirnetVar) {
   const v = escapeForRegex(kirnetVar);
+  const typedVarMatch = line.match(
+    new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateVariable\\s*\\(.*?\\)\\s*::\\s*(?:${v}\\s*\\.\\s*)?Variable\\s*<(.+)>\\s*,?\\s*$`)
+  );
+  if (typedVarMatch) {
+    const name = typedVarMatch[1];
+    const typeArg = typedVarMatch[2].trim();
+    return { name, type: `Variable<${typeArg}>` };
+  }
+  const untypedVarMatch = line.match(
+    new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*CreateVariable\\s*\\((.+?)\\)\\s*,?\\s*$`)
+  );
+  if (untypedVarMatch) {
+    const name = untypedVarMatch[1];
+    const inferredType = inferLiteralType(untypedVarMatch[2].trim());
+    return { name, type: `Variable<${inferredType}>` };
+  }
   const typedSignalMatch = line.match(
     new RegExp(`^(\\w+)\\s*=\\s*${v}\\s*\\.\\s*(?:CreateServerSignal|CreateClientSignal|CreateSignal)\\s*\\(.*?\\)\\s*::\\s*((?:${v}\\s*\\.\\s*)?(?:ServerSignal|ClientSignal|Signal)\\s*<(.+)>)\\s*,?\\s*$`)
   );
@@ -2607,10 +2682,9 @@ function tryParseField(line, serviceName, filePath, offsetInContent, fullContent
     let type = rawType.replace(/\s+/g, " ").replace(new RegExp(`${v}\\s*\\.\\s*`, "g"), "").trim();
     if (type.startsWith("Signal<")) {
       const innerType = typedSignalMatch[3];
-      if (line.includes("CreateClientSignal")) {
-        type = `ClientSignal<${innerType}>`;
-      } else if (line.includes("CreateServerSignal")) {
-        type = `ServerSignal<${innerType}>`;
+      const kind = inferSignalKindFromConstructor(line, line);
+      if (kind !== "Signal") {
+        type = `${kind}<${innerType}>`;
       }
     }
     return { name, type };
@@ -2620,12 +2694,7 @@ function tryParseField(line, serviceName, filePath, offsetInContent, fullContent
   );
   if (untypedSignalMatch) {
     const name = untypedSignalMatch[1];
-    let signalKind = "Signal";
-    if (line.includes("CreateClientSignal")) {
-      signalKind = "ClientSignal";
-    } else if (line.includes("CreateServerSignal")) {
-      signalKind = "ServerSignal";
-    }
+    const signalKind = inferSignalKindFromConstructor(line, line);
     return { name, type: `${signalKind}<any>` };
   }
   const funcMatch = line.match(
@@ -2666,7 +2735,7 @@ function generateTypesContent(services, requirePath) {
   lines.push("-- Do not edit manually. This file is overwritten on every save.");
   lines.push("--");
   lines.push("-- Require this module instead of KirNet for fully typed GetService().");
-  lines.push("-- All other KirNet methods (CreateServerSignal, RegisterService, etc.) work as normal.");
+  lines.push("-- All other KirNet methods (CreateSignal, RegisterService, etc.) work as normal.");
   lines.push("");
   lines.push(`local KirNet = require(${requirePath})`);
   lines.push("");
@@ -2711,6 +2780,12 @@ function generateTypesContent(services, requirePath) {
   lines.push("	Call: (self: ServerFunction<TReturn>, ...any) -> TReturn,");
   lines.push("}");
   lines.push("");
+  lines.push("type Variable<T> = {");
+  lines.push("	Get: (self: Variable<T>) -> T,");
+  lines.push("	Set: (self: Variable<T>, value: T) -> (),");
+  lines.push("	OnChanged: (self: Variable<T>, callback: (newValue: T, oldValue: T) -> ()) -> (),");
+  lines.push("}");
+  lines.push("");
   lines.push("-- ============================================================");
   lines.push("-- Service Types");
   lines.push("-- ============================================================");
@@ -2719,7 +2794,7 @@ function generateTypesContent(services, requirePath) {
     const typeName = `${svc.name}Type`;
     lines.push(`export type ${typeName} = {`);
     for (const field of svc.fields) {
-      const fieldType = field.type.replace(/\bKirNet\s*\.\s*ServerSignal\s*</g, "ServerSignal<").replace(/\bKirNet\s*\.\s*ClientSignal\s*</g, "ClientSignal<").replace(/\bKirNet\s*\.\s*ServerFunction\s*</g, "ServerFunction<").replace(/\bKirNet\s*\.\s*Signal\s*</g, "Signal<").replace(/\bKirNet\s*\.\s*Function\s*</g, "ServerFunction<");
+      const fieldType = field.type.replace(/\bKirNet\s*\.\s*ServerSignal\s*</g, "ServerSignal<").replace(/\bKirNet\s*\.\s*ClientSignal\s*</g, "ClientSignal<").replace(/\bKirNet\s*\.\s*ServerFunction\s*</g, "ServerFunction<").replace(/\bKirNet\s*\.\s*Signal\s*</g, "Signal<").replace(/\bKirNet\s*\.\s*Function\s*</g, "ServerFunction<").replace(/\bKirNet\s*\.\s*Variable\s*</g, "Variable<");
       lines.push(`	${field.name}: ${fieldType},`);
     }
     lines.push("}");
@@ -2750,11 +2825,9 @@ function generateTypesContent(services, requirePath) {
   lines.push("type TypedKirNet = {");
   lines.push("	GetService: GetServiceOverloads,");
   lines.push("	RegisterService: RegisterServiceOverloads,");
-  lines.push("	CreateServerSignal: typeof(KirNet.CreateServerSignal),");
-  lines.push("	CreateClientSignal: typeof(KirNet.CreateClientSignal),");
   lines.push("	CreateSignal: typeof(KirNet.CreateSignal),");
-  lines.push("	CreateServerFunction: typeof(KirNet.CreateServerFunction),");
   lines.push("	CreateFunction: typeof(KirNet.CreateFunction),");
+  lines.push("	CreateVariable: typeof(KirNet.CreateVariable),");
   lines.push("	UseMiddleware: typeof(KirNet.UseMiddleware),");
   lines.push("	SetDebug: typeof(KirNet.SetDebug),");
   lines.push("}");
@@ -2890,6 +2963,9 @@ var config;
 var workspaceRoot;
 var statusBarItem;
 var diagnosticCollection;
+var extensionEnabled = true;
+var extensionContext;
+var DEFAULT_GITHUB_README_URL = "https://github.com/MrKirdid/KirNet#readme";
 var resolvedEntry = null;
 var lastParsedServices = [];
 function activate(context) {
@@ -2898,23 +2974,30 @@ function activate(context) {
     return;
   }
   workspaceRoot = folders[0].uri.fsPath;
+  extensionContext = context;
   if (!fs3.existsSync(path3.join(workspaceRoot, "default.project.json"))) {
     return;
   }
   config = readConfig(workspaceRoot);
   log("KirNet Type Generator activated");
   log(`Workspace: ${workspaceRoot}`);
+  const storedEnabled = context.workspaceState.get("kirnet.enabled");
+  if (storedEnabled !== void 0) {
+    extensionEnabled = storedEnabled;
+  } else {
+    extensionEnabled = fs3.existsSync(path3.join(workspaceRoot, "kirnet.toml"));
+  }
   statusBarItem = vscode4.window.createStatusBarItem(vscode4.StatusBarAlignment.Right, 100);
   statusBarItem.command = "kirnet.showOutput";
-  statusBarItem.text = "$(sync~spin) KirNet Types";
-  statusBarItem.show();
   context.subscriptions.push(statusBarItem);
+  updateStatusBar();
   diagnosticCollection = vscode4.languages.createDiagnosticCollection("kirnet");
   context.subscriptions.push(diagnosticCollection);
   registerCompletionProvider(context);
   context.subscriptions.push(
     vscode4.commands.registerCommand("kirnet.regenerateTypes", () => regenerate("command")),
     vscode4.commands.registerCommand("kirnet.showOutput", () => getChannel().show()),
+    vscode4.commands.registerCommand("kirnet.openGithubReadme", () => openGitHubReadmeCommand(context.extension)),
     vscode4.commands.registerCommand("kirnet.openTypesFile", () => {
       const target = resolvedEntry?.entryFile ?? path3.join(workspaceRoot, config.paths.output);
       if (fs3.existsSync(target)) {
@@ -2932,9 +3015,13 @@ function activate(context) {
     vscode4.commands.registerCommand("kirnet.listServices", () => listServicesCommand()),
     vscode4.commands.registerCommand("kirnet.goToService", () => goToServiceCommand()),
     vscode4.commands.registerCommand("kirnet.restorePackage", () => restorePackageCommand()),
-    vscode4.commands.registerCommand("kirnet.createService", () => scaffoldCommand())
+    vscode4.commands.registerCommand("kirnet.createService", () => scaffoldCommand()),
+    vscode4.commands.registerCommand("kirnet.init", () => initCommand()),
+    vscode4.commands.registerCommand("kirnet.enable", () => setEnabled(true)),
+    vscode4.commands.registerCommand("kirnet.disable", () => setEnabled(false))
   );
   const servicesAbsPath = path3.resolve(workspaceRoot, config.paths.services).toLowerCase();
+  const controllersAbsPath = config.paths.controllers ? path3.resolve(workspaceRoot, config.paths.controllers).toLowerCase() : null;
   context.subscriptions.push(
     createSaveHandler(
       (uri) => regenerate(`saved: ${path3.relative(workspaceRoot, uri.fsPath)}`),
@@ -2943,7 +3030,9 @@ function activate(context) {
         if (resolvedEntry && fp === resolvedEntry.entryFile.toLowerCase()) {
           return false;
         }
-        return fp.startsWith(servicesAbsPath);
+        if (fp.startsWith(servicesAbsPath)) return true;
+        if (controllersAbsPath && fp.startsWith(controllersAbsPath)) return true;
+        return false;
       }
     )
   );
@@ -3151,12 +3240,20 @@ function ensureBackup(entry) {
   fs3.copyFileSync(entry.entryFile, backupPath);
 }
 async function regenerate(trigger) {
+  if (!extensionEnabled) {
+    log(`Skipped regeneration (disabled) \u2014 trigger: ${trigger}`);
+    return;
+  }
   statusBarItem.text = "$(sync~spin) KirNet Types";
   log(`--- Regenerating (trigger: ${trigger}) ---`);
   try {
+    const scanPaths = [config.paths.services];
+    if (config.paths.controllers) {
+      scanPaths.push(config.paths.controllers);
+    }
     const result = parseAll(
       workspaceRoot,
-      [config.paths.services],
+      scanPaths,
       config.options.debug
     );
     log(`Found ${result.services.length} service(s)`);
@@ -3227,6 +3324,22 @@ function updateDiagnostics(result) {
   for (const [filePath, diags] of byFile) {
     diagnosticCollection.set(vscode4.Uri.file(filePath), diags);
   }
+}
+function getGitHubReadmeUrl(extension) {
+  const homepage = extension.packageJSON.homepage;
+  if (typeof homepage === "string" && homepage.trim().length > 0) {
+    return homepage;
+  }
+  return DEFAULT_GITHUB_README_URL;
+}
+async function openGitHubReadmeCommand(extension) {
+  const url = getGitHubReadmeUrl(extension);
+  const didOpen = await vscode4.env.openExternal(vscode4.Uri.parse(url));
+  if (!didOpen) {
+    vscode4.window.showWarningMessage("Could not open the KirNet GitHub README.");
+    return;
+  }
+  log(`Opened GitHub README: ${url}`);
 }
 async function listServicesCommand() {
   if (lastParsedServices.length === 0) {
@@ -3337,8 +3450,8 @@ async function scaffoldCommand() {
     `local KirNet = require(game:GetService("ReplicatedStorage").Shared.Packages.kirnet)`,
     "",
     `KirNet.RegisterService("${name}", {`,
-    "	ExampleBroadcast = KirNet.CreateServerSignal() :: KirNet.ServerSignal<string>,",
-    "	ExampleEvent = KirNet.CreateClientSignal() :: KirNet.ClientSignal<string>,",
+    `	ExampleBroadcast = KirNet.CreateSignal({ direction = "server" }) :: KirNet.Signal<string>,`,
+    `	ExampleEvent = KirNet.CreateSignal({ direction = "client" }) :: KirNet.Signal<string>,`,
     "})",
     ""
   ].join("\n");
@@ -3347,6 +3460,59 @@ async function scaffoldCommand() {
   const doc = await vscode4.workspace.openTextDocument(filePath);
   await vscode4.window.showTextDocument(doc);
   log(`Created service: ${path3.relative(workspaceRoot, filePath)}`);
+}
+async function initCommand() {
+  const configPath = path3.join(workspaceRoot, "kirnet.toml");
+  if (fs3.existsSync(configPath)) {
+    const overwrite = await vscode4.window.showWarningMessage(
+      "kirnet.toml already exists. Overwrite?",
+      "Overwrite",
+      "Cancel"
+    );
+    if (overwrite !== "Overwrite") {
+      return;
+    }
+  }
+  const content = [
+    "[paths]",
+    'services = "src/Server/Services"',
+    'controllers = "src/Shared/Controllers"',
+    'output = "src/ReplicatedStorage/Shared/Packages/KirNet/Types.luau"',
+    'kirnet_package = ""',
+    "",
+    "[options]",
+    `kirnet_require_path = 'game:GetService("ReplicatedStorage").Shared.Packages.KirNet'`,
+    "debug = false",
+    ""
+  ].join("\n");
+  fs3.writeFileSync(configPath, content, "utf-8");
+  log("Created kirnet.toml");
+  config = readConfig(workspaceRoot);
+  resolvedEntry = null;
+  await setEnabled(true);
+  const doc = await vscode4.workspace.openTextDocument(configPath);
+  await vscode4.window.showTextDocument(doc);
+  vscode4.window.showInformationMessage("KirNet initialized \u2014 edit kirnet.toml to match your project.");
+}
+async function setEnabled(enabled) {
+  extensionEnabled = enabled;
+  await extensionContext.workspaceState.update("kirnet.enabled", enabled);
+  updateStatusBar();
+  log(`KirNet ${enabled ? "enabled" : "disabled"}`);
+  vscode4.window.showInformationMessage(`KirNet type generation ${enabled ? "enabled" : "disabled"}.`);
+  if (enabled) {
+    regenerate("enabled");
+  }
+}
+function updateStatusBar() {
+  if (!extensionEnabled) {
+    statusBarItem.text = "$(circle-slash) KirNet (disabled)";
+    statusBarItem.tooltip = "KirNet type generation is disabled. Run 'KirNet: Enable' to turn it on.";
+    statusBarItem.show();
+  } else {
+    statusBarItem.text = "$(check) KirNet Types";
+    statusBarItem.show();
+  }
 }
 function deactivate() {
   dispose();

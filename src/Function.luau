@@ -1,4 +1,4 @@
-﻿--!strict
+--!strict
 
 --[[
 	Function.luau - ServerFunction (request/response) implementation for KirNet.
@@ -30,6 +30,15 @@ local FLAG_LOSSY: number = 0x04
 
 local _remoteFunction: RemoteFunction? = nil
 local _debugEnabled = false
+
+local function packArgs(...: any): { any }
+	return table.pack(...)
+end
+
+local function unpackArgs(args: { any }): ...any
+	local packed = args :: any
+	return table.unpack(packed, 1, packed.n or #packed)
+end
 
 function KirFunction.setRemoteFunction(remote: RemoteFunction)
 	_remoteFunction = remote
@@ -114,13 +123,13 @@ function KirFunction._init(self: any, serviceName: string, methodName: string, i
 	self._id = id
 end
 
-local function preparePayload(self: any, ...: any): (buffer, number)
+local function preparePayload(self: any, ...: any): (buffer, number, { any })
 	local opts = self._options :: Types.SignalOptions
 	local precision = opts.precision or 2
 	local lossy = opts.lossy or false
 	local compressionThreshold = opts.compressionThreshold or 64
 
-	local payload = Codec.encode(precision, lossy, ...)
+	local payload, passthrough = Codec.encode(precision, lossy, ...)
 	local rawSize = buffer.len(payload)
 	local flags: number = 0
 
@@ -136,7 +145,7 @@ local function preparePayload(self: any, ...: any): (buffer, number)
 		end
 	end
 
-	return payload, flags
+	return payload, flags, passthrough
 end
 
 local function buildPacket(routeId: number, flags: number, payload: buffer): buffer
@@ -175,10 +184,13 @@ end
 --- ServerFunction only, client only.
 function KirFunction.Call(self: any, ...: any): ...any
 	if IS_SERVER then
-		error(string.format(
-			"[KirNet] %s.%s:Call() failed - Call() can only be used on the client.",
-			self._serviceName or "?", self._methodName or "?"
-		))
+		error(
+			string.format(
+				"[KirNet] %s.%s:Call() failed - Call() can only be used on the client.",
+				self._serviceName or "?",
+				self._methodName or "?"
+			)
+		)
 	end
 
 	local remote = _remoteFunction
@@ -190,7 +202,7 @@ function KirFunction.Call(self: any, ...: any): ...any
 		name = self._methodName or "",
 		service = self._serviceName or "",
 		player = nil,
-		payload = { ... },
+		payload = packArgs(...),
 		direction = "c2s",
 	}
 	if not Middleware.execute(context) then
@@ -198,18 +210,26 @@ function KirFunction.Call(self: any, ...: any): ...any
 	end
 
 	local routeId = self._id
-	local payload, flags = preparePayload(self, table.unpack(context.payload))
+	local payload, flags, passthrough = preparePayload(self, unpackArgs(context.payload))
 	local pkt = buildPacket(routeId, flags, payload)
 
 	if _debugEnabled then
 		print(string.format("[KirNet] %s.%s:Call() -> server", self._serviceName or "?", self._methodName or "?"))
 	end
 
-	local result = remote:InvokeServer(pkt)
+	local result, resultPassthrough
+	if #passthrough > 0 then
+		result, resultPassthrough = remote:InvokeServer(pkt, passthrough)
+	else
+		result, resultPassthrough = remote:InvokeServer(pkt)
+	end
 
 	if typeof(result) == "buffer" then
 		local _, responsePayload = decodePacket(result)
-		return Codec.decode(responsePayload)
+		local opts = self._options :: Types.SignalOptions
+		local p = if opts.lossy then opts.precision or 2 else nil
+		local pt = if typeof(resultPassthrough) == "table" then resultPassthrough else nil
+		return Codec.decode(responsePayload, p, pt)
 	end
 
 	return result
@@ -217,25 +237,29 @@ end
 
 --- Internal: Handle an incoming function invoke on the server side.
 --- Includes rate limiting enforcement.
-function KirFunction._handleInvoke(self: any, player: Player, pkt: buffer): buffer?
+function KirFunction._handleInvoke(self: any, player: Player, pkt: buffer, passthrough: { any }?): (buffer?, { any }?)
 	if not self._handler then
-		warn(string.format(
-			"[KirNet] %s.%s has no handler registered.",
-			self._serviceName or "?", self._methodName or "?"
-		))
-		return nil
+		warn(
+			string.format(
+				"[KirNet] %s.%s has no handler registered.",
+				self._serviceName or "?",
+				self._methodName or "?"
+			)
+		)
+		return nil, nil
 	end
 
 	-- Rate limiting for incoming client calls
 	local opts = self._options :: Types.SignalOptions
 	if opts.rateLimit and self._id then
 		if not checkRateLimit(self._id, player, opts.rateLimit, self._serviceName or "", self._methodName or "") then
-			return nil
+			return nil, nil
 		end
 	end
 
 	local _, payload = decodePacket(pkt)
-	local args = { Codec.decode(payload) }
+	local p = if opts.lossy then opts.precision or 2 else nil
+	local args = packArgs(Codec.decode(payload, p, passthrough))
 
 	local context: Types.MiddlewareContext = {
 		name = self._methodName or "",
@@ -249,12 +273,23 @@ function KirFunction._handleInvoke(self: any, player: Player, pkt: buffer): buff
 	end
 
 	if _debugEnabled then
-		print(string.format("[KirNet] %s.%s:_handleInvoke() from %s", self._serviceName or "?", self._methodName or "?", player.Name))
+		print(
+			string.format(
+				"[KirNet] %s.%s:_handleInvoke() from %s",
+				self._serviceName or "?",
+				self._methodName or "?",
+				player.Name
+			)
+		)
 	end
 
-	local results = { self._handler(player, table.unpack(context.payload)) }
-	local responsePayload, responseFlags = preparePayload(self, table.unpack(results))
-	return buildPacket(self._id or 0, responseFlags, responsePayload)
+	local results = packArgs(self._handler(player, unpackArgs(context.payload)))
+	local responsePayload, responseFlags, responsePassthrough = preparePayload(self, unpackArgs(results))
+	local responsePkt = buildPacket(self._id or 0, responseFlags, responsePayload)
+	if #responsePassthrough > 0 then
+		return responsePkt, responsePassthrough
+	end
+	return responsePkt, nil
 end
 
 return KirFunction

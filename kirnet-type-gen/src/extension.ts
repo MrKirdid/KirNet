@@ -12,6 +12,10 @@ let config: KirNetConfig;
 let workspaceRoot: string;
 let statusBarItem: vscode.StatusBarItem;
 let diagnosticCollection: vscode.DiagnosticCollection;
+let extensionEnabled = true;
+let extensionContext: vscode.ExtensionContext;
+
+const DEFAULT_GITHUB_README_URL = "https://github.com/MrKirdid/KirNet#readme";
 
 /**
  * Describes the file luau-lsp resolves when the user writes
@@ -41,6 +45,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	}
 
 	workspaceRoot = folders[0].uri.fsPath;
+	extensionContext = context;
 
 	if (!fs.existsSync(path.join(workspaceRoot, "default.project.json"))) {
 		return;
@@ -50,12 +55,20 @@ export function activate(context: vscode.ExtensionContext): void {
 	logger.log("KirNet Type Generator activated");
 	logger.log(`Workspace: ${workspaceRoot}`);
 
+	// Restore enabled state from workspace storage (default: true if kirnet.toml exists)
+	const storedEnabled = context.workspaceState.get<boolean>("kirnet.enabled");
+	if (storedEnabled !== undefined) {
+		extensionEnabled = storedEnabled;
+	} else {
+		// Auto-disable if no kirnet.toml
+		extensionEnabled = fs.existsSync(path.join(workspaceRoot, "kirnet.toml"));
+	}
+
 	// Status bar
 	statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	statusBarItem.command = "kirnet.showOutput";
-	statusBarItem.text = "$(sync~spin) KirNet Types";
-	statusBarItem.show();
 	context.subscriptions.push(statusBarItem);
+	updateStatusBar();
 
 	// Diagnostics
 	diagnosticCollection = vscode.languages.createDiagnosticCollection("kirnet");
@@ -68,6 +81,7 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(
 		vscode.commands.registerCommand("kirnet.regenerateTypes", () => regenerate("command")),
 		vscode.commands.registerCommand("kirnet.showOutput", () => logger.getChannel().show()),
+		vscode.commands.registerCommand("kirnet.openGithubReadme", () => openGitHubReadmeCommand(context.extension)),
 		vscode.commands.registerCommand("kirnet.openTypesFile", () => {
 			const target = resolvedEntry?.entryFile ?? path.join(workspaceRoot, config.paths.output);
 			if (fs.existsSync(target)) {
@@ -86,10 +100,16 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand("kirnet.goToService", () => goToServiceCommand()),
 		vscode.commands.registerCommand("kirnet.restorePackage", () => restorePackageCommand()),
 		vscode.commands.registerCommand("kirnet.createService", () => scaffoldCommand()),
+		vscode.commands.registerCommand("kirnet.init", () => initCommand()),
+		vscode.commands.registerCommand("kirnet.enable", () => setEnabled(true)),
+		vscode.commands.registerCommand("kirnet.disable", () => setEnabled(false)),
 	);
 
 	// Save watcher — regenerate when service source files are saved
 	const servicesAbsPath = path.resolve(workspaceRoot, config.paths.services).toLowerCase();
+	const controllersAbsPath = config.paths.controllers
+		? path.resolve(workspaceRoot, config.paths.controllers).toLowerCase()
+		: null;
 
 	context.subscriptions.push(
 		createSaveHandler(
@@ -100,7 +120,9 @@ export function activate(context: vscode.ExtensionContext): void {
 				if (resolvedEntry && fp === resolvedEntry.entryFile.toLowerCase()) {
 					return false;
 				}
-				return fp.startsWith(servicesAbsPath);
+				if (fp.startsWith(servicesAbsPath)) return true;
+				if (controllersAbsPath && fp.startsWith(controllersAbsPath)) return true;
+				return false;
 			},
 		),
 	);
@@ -359,13 +381,23 @@ function ensureBackup(entry: KirNetEntry): void {
 }
 
 async function regenerate(trigger: string): Promise<void> {
+	if (!extensionEnabled) {
+		logger.log(`Skipped regeneration (disabled) — trigger: ${trigger}`);
+		return;
+	}
+
 	statusBarItem.text = "$(sync~spin) KirNet Types";
 	logger.log(`--- Regenerating (trigger: ${trigger}) ---`);
 
 	try {
+		const scanPaths = [config.paths.services];
+		if (config.paths.controllers) {
+			scanPaths.push(config.paths.controllers);
+		}
+
 		const result = parseAll(
 			workspaceRoot,
-			[config.paths.services],
+			scanPaths,
 			config.options.debug,
 		);
 
@@ -454,9 +486,30 @@ function updateDiagnostics(result: ParseResult): void {
 	}
 }
 
+function getGitHubReadmeUrl(extension: vscode.Extension<any>): string {
+	const homepage = extension.packageJSON.homepage;
+	if (typeof homepage === "string" && homepage.trim().length > 0) {
+		return homepage;
+	}
+
+	return DEFAULT_GITHUB_README_URL;
+}
+
 // ────────────────────────────────────────────────────────────────
 // Commands
 // ────────────────────────────────────────────────────────────────
+
+async function openGitHubReadmeCommand(extension: vscode.Extension<any>): Promise<void> {
+	const url = getGitHubReadmeUrl(extension);
+	const didOpen = await vscode.env.openExternal(vscode.Uri.parse(url));
+
+	if (!didOpen) {
+		vscode.window.showWarningMessage("Could not open the KirNet GitHub README.");
+		return;
+	}
+
+	logger.log(`Opened GitHub README: ${url}`);
+}
 
 async function listServicesCommand(): Promise<void> {
 	if (lastParsedServices.length === 0) {
@@ -580,8 +633,8 @@ async function scaffoldCommand(): Promise<void> {
 		`local KirNet = require(game:GetService("ReplicatedStorage").Shared.Packages.kirnet)`,
 		"",
 		`KirNet.RegisterService("${name}", {`,
-		"\tExampleBroadcast = KirNet.CreateServerSignal() :: KirNet.ServerSignal<string>,",
-		"\tExampleEvent = KirNet.CreateClientSignal() :: KirNet.ClientSignal<string>,",
+		`\tExampleBroadcast = KirNet.CreateSignal({ direction = "server" }) :: KirNet.Signal<string>,`,
+		`\tExampleEvent = KirNet.CreateSignal({ direction = "client" }) :: KirNet.Signal<string>,`,
 		"})",
 		"",
 	].join("\n");
@@ -591,6 +644,68 @@ async function scaffoldCommand(): Promise<void> {
 	const doc = await vscode.workspace.openTextDocument(filePath);
 	await vscode.window.showTextDocument(doc);
 	logger.log(`Created service: ${path.relative(workspaceRoot, filePath)}`);
+}
+
+async function initCommand(): Promise<void> {
+	const configPath = path.join(workspaceRoot, "kirnet.toml");
+	if (fs.existsSync(configPath)) {
+		const overwrite = await vscode.window.showWarningMessage(
+			"kirnet.toml already exists. Overwrite?",
+			"Overwrite",
+			"Cancel",
+		);
+		if (overwrite !== "Overwrite") {
+			return;
+		}
+	}
+
+	const content = [
+		"[paths]",
+		'services = "src/Server/Services"',
+		'controllers = "src/Shared/Controllers"',
+		'output = "src/ReplicatedStorage/Shared/Packages/KirNet/Types.luau"',
+		'kirnet_package = ""',
+		"",
+		"[options]",
+		'kirnet_require_path = \'game:GetService("ReplicatedStorage").Shared.Packages.KirNet\'',
+		"debug = false",
+		"",
+	].join("\n");
+
+	fs.writeFileSync(configPath, content, "utf-8");
+	logger.log("Created kirnet.toml");
+
+	// Reload config and enable
+	config = readConfig(workspaceRoot);
+	resolvedEntry = null;
+	await setEnabled(true);
+
+	const doc = await vscode.workspace.openTextDocument(configPath);
+	await vscode.window.showTextDocument(doc);
+	vscode.window.showInformationMessage("KirNet initialized — edit kirnet.toml to match your project.");
+}
+
+async function setEnabled(enabled: boolean): Promise<void> {
+	extensionEnabled = enabled;
+	await extensionContext.workspaceState.update("kirnet.enabled", enabled);
+	updateStatusBar();
+	logger.log(`KirNet ${enabled ? "enabled" : "disabled"}`);
+	vscode.window.showInformationMessage(`KirNet type generation ${enabled ? "enabled" : "disabled"}.`);
+
+	if (enabled) {
+		regenerate("enabled");
+	}
+}
+
+function updateStatusBar(): void {
+	if (!extensionEnabled) {
+		statusBarItem.text = "$(circle-slash) KirNet (disabled)";
+		statusBarItem.tooltip = "KirNet type generation is disabled. Run 'KirNet: Enable' to turn it on.";
+		statusBarItem.show();
+	} else {
+		statusBarItem.text = "$(check) KirNet Types";
+		statusBarItem.show();
+	}
 }
 
 export function deactivate(): void {
